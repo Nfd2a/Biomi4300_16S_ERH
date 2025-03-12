@@ -1,0 +1,806 @@
+---
+title: "Assigning ASVs with DADA2"
+author: "Antone Jung"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document: 
+    code_folding: show
+    theme: spacelab
+    highlight: pygments
+    keep_md: no
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+      toc_depth: 3
+  keep_md: true  
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center", 
+                      # Send figures generated in this file to this folder below
+                      fig.path = "../figures/02_AssignASVs/")
+```
+
+# Goals 
+
+1. Infer an error model for in the filtered sequences, separately on forward and reverse reads.
+2. Assign ASVs on both forward and reverse reads separately by applying the error model.
+3. Merge forward and reverse ASVs into "contiguous ASVs".
+4. Generate the first draft of ASV count table.
+5. Quality Trimming of ASV lengths.
+6. Remove chimeras. 
+7. Assign Taxonomy with Silva Database. 
+8. Write out relevant files: `asv_table`, `asvs_fasta`, `tax_table`, and `sample_data`.
+
+## Input 
+
+1. Filtered fastq files generated from `01_QualityTrimming.Rmd`.
+2. Sample Name vector.
+
+## Output 
+
+1. ASV Count Table: `asv_table` (with and without sequence names)
+2. ASV fasta file: `asvs_fasta` for building a phylogenetic tree at a later step.
+3. Taxonomy Table  `tax_table`
+4. Sample Information: `sample_data`  track the reads lots throughout DADA2 workflow. 
+
+# Set up the Environment 
+
+## Set Seed & Threads
+
+We need to be mindful of others when we are using the server. We learned in this lesson that we can use `top` and `htop` in the shell to see how many users are currently on the server. So, if you're working through something outside of class, it's ok to increase the number of threads. And, it will make everything go faster! 
+
+Then, when we have a `multithread` parameter, we can set it to be `multithread = n_threads`. If we notice more people on the server, we can modify the n_threads in this one location. 
+
+```{r set-seed}
+# Set the seed for reproducibility
+set.seed(10202005)
+
+# Let's make a parameter to set the number of threads 
+n_threads = 6
+```
+
+
+## Load Packages 
+```{r load-packages}
+# Efficient package loading with pacman 
+pacman::p_load(tidyverse, devtools, dada2, 
+               patchwork, DT, install = FALSE)
+```
+
+## Load Filtered Fastq Files 
+
+```{r load-filtered-fastqs}
+# Place filtered seq files into a variable 
+filtered_fastqs_path <- "data/01_DADA2/02_filtered_fastqs"
+
+# Intuition check:
+filtered_fastqs_path
+
+# Create Forward vector 
+filtered_forward_reads <- 
+  list.files(filtered_fastqs_path, pattern = "_1.fastq.gz",
+             full.names = TRUE)
+# Check 
+filtered_forward_reads[1:5]
+
+# Reverse vector 
+filtered_reverse_reads <- 
+    list.files(filtered_fastqs_path, pattern = "_2.fastq.gz",
+             full.names = TRUE)
+
+# Check 
+filtered_reverse_reads[1:5]
+```
+
+## Sample Names 
+```{r sample-names}
+# Create vector of sample names from the filenames 
+sample_names <- sapply(strsplit(basename(filtered_forward_reads), "_"), `[`,1) 
+
+# Intuition Check 
+head(sample_names)
+```
+
+
+# Error Modelling 
+
+## How does it work? 
+
+This is the step along the workflow where we try to estimate what is a *mistake* from technological sequencing error versus what is *true biological variation*. Therefore, this step is another critical step that we need to be mindful of! This is also what makes DADA2 unique!  
+
+Specifically, we will infer error rates for all possible *transitions* within purines and pyrimidines (A<>G or C<>T) and *transversions* between all purine and pyrimidine combinations. The error model is learned by alternating estimation of the error rates and inference of sample composition until they converge. It starts with abundant sequences first and then goes to less abundant sequences. It will:  
+
+1. Starts with the assumption that the error rates are the maximum (takes the most abundant sequence ("center") and assumes it's the only sequence not caused by errors).  
+2. Compares the other sequences to the most abundant sequence. 
+3. Uses at most 10^8^ nucleotides for the error estimation. (Though, sometimes we increase this parameter in the case of binned sequencing quality scores.)  
+4. Uses parametric error estimation function of loess fit on the observed error rates. 
+
+## Important Notes
+
+**First, every individual sequencing run needs to have it's own and separate error model!** This is because every sequencing run is unique—even if the flow cell and DNA/samples are *exactly the same*. 
+
+While you can combine multiple datasets together after running them through DADA2, if you'd like to limit bias and combine data sets from multiple sequencing runs, it is ideal to do the following:  
+
+1. Use the exact same DNA extractions and library prep (*e.g.* same primer sets). 
+2. Perform the exact same `filterAndTrim()`, with equivalent parameters between sequencing runs. This is because we need to have the exact same ASV length expected by the output of our filtering and trimming.
+3. Assign ASVs on forward and reverse reads, merge them, and then once you have the ASV table from each sequencing run, you can merge them together.
+
+But wait: *What contributes to sequencing error in different sequencing runs and why do we need to model errors separately per run with `learnErrors()` in dada2?* Remember the core principles of how Illumina sequencing works! Some things that contribute to this are:  
+
+a. Each sequencing run has a **unique timing for when clusters go out of sync** (*e.g.,* the drop in quality at end of reads, which is typical of Illumina sequencing. This decrease in read quality is especially true of older Illumina sequencing data and is improving with more recent technologies. 
+b. The **cluster density is impossible to replicate**. Therefore, the cluster density (and therefore sequence quality) will always be different between sequencing runs (even if it's the same person/samples/sequencing facility!). This is getting easier to replicate with the newer flow cells (*e.g.,* patterned flow cells) but is not yet possible. 
+c. **PhiX spike-in will also vary between runs**, even if we try to make it the same! Therefore, the amount of heterogeneity on the flow cell will also be different, which further impacting the sequencing quality.  
+d. **Different locations on the flow cell can be impacted differently between runs.** Perhaps an air bubble can get in. Or, as mentioned above, the cluster density is higher and/or lower on a different run/flow cell. In the old, non-patterned flow cells, sometimes clusters can form nearby each other. However, this has been solved on the new, patterned flow cells where clusters have a specific distance between each other. 
+
+**Second, this step uses our quality scores, which is rapidly changing with new sequencing technologies!** Therefore, we need to be mindful of how we run our error models. The traditional error models were developed based on the 40 Phred scores that were generated by early Illumina Sequencing technologies. However, with the new binned quality scores, we need to incorporate new ways of error modeling and this is constanstly changing right now, which you can see in this [very active discussion on the DADA2 GitHub page](https://github.com/benjjneb/dada2/issues/1307). 
+
+Now, let's consider the two types of Illumina data output and how it might inform our error modeling. 
+
+## Learn the Errors
+
+### MiSeq Runs: 40 Phred Scores
+
+Here, in the data we have sequenced here, we have Illumina MiSeq data with the traditional 40 Phred scores. Therefore, we can use the traditional `learnErrors()` command, which we will do below. 
+
+```{r learn-errors-MiSeq, fig.width=12, fig.height=8}
+# Forward Reads 
+error_forward_reads <- 
+  learnErrors(filtered_forward_reads, multithread = n_threads)
+
+# Forward Error Plot 
+forward_error_plot <- 
+  plotErrors(error_forward_reads, nominalQ = TRUE) + 
+  labs(title = "Forward Reads: Error Model")
+
+# Reverse Reads 
+error_reverse_reads <- 
+  learnErrors(filtered_reverse_reads, multithread = n_threads)
+
+# Reverse Error Plot 
+reverse_error_plot <- 
+  plotErrors(error_reverse_reads, nominalQ = TRUE) + 
+  labs(title = "Reverse Reads: Error Model")
+
+# Look at the plots together 
+forward_error_plot + reverse_error_plot
+```
+
+The above plot represents the error rates for each possible transition (A→C, A→G, …) in the forward reads (on the left) and the reverse reads (on the right).
+
+Details of the plots above: 
+- **Points**: The observed error rates for each consensus quality score.  
+- **Black line**: Estimated error rates after convergence of the machine-learning algorithm.  
+- **Red line:** The error rates expected under the nominal definition of the Q-score.  
+
+Similar to what is mentioned in the [DADA2 tutorial](https://benjjneb.github.io/dada2/tutorial_1_8.html): the estimated error rates (black line) are a "reasonably good" fit to the observed rates (points), and the error rates drop with increased quality as expected.  We can now infer ASVs! 
+
+# Infer ASVs
+
+**An important note:** What makes DADA2 so nice is that it infers ASVs separately on the forward and the reverse reads and then merges them afterwards. This is quite a different approach from how OTUs are identified in Mothur and also from UCHIME, oligotyping, and other OTU, MED, and ASV approaches.
+
+```{r infer-ASVs}
+# Infer ASVs on the forward sequences
+dada_forward <- 
+  dada(filtered_forward_reads, 
+       err = error_forward_reads,
+       multithread = n_threads) 
+
+# Take a look at the data
+# What type of data structure is it? 
+typeof(dada_forward) # It's a list 
+length(dada_forward) # How big is it? One per sample!
+
+# What doees it look like for each sample?  
+dada_forward$`SRR12183139_1.fastq.gz`
+
+# Reverse ASVs
+dada_reverse <- 
+  dada(filtered_reverse_reads,
+       err = error_reverse_reads ,
+       multithread = n_threads)
+
+# Check data 
+dada_reverse[30]
+```
+
+# Merge Forward and Reverse ASVs 
+
+Now, that we have identified our ASVs separately on both the forward and the reverse reads, let's **merge** them together into contiguous (*aka* "contigs") ASVs.
+
+```{r merge-ASVs}
+merged_ASVs <- 
+  mergePairs(dada_forward, filtered_forward_reads,
+             dada_reverse, filtered_reverse_reads,
+             verbose = TRUE)
+
+# Evaluate the data output 
+typeof(merged_ASVs) # A list
+length(merged_ASVs) # Length of the number of samples!
+head(names(merged_ASVs)) # Here, we can access our current sample names
+
+# Inspect further for each sample
+#head(merged_ASVs, n = 2) # A dataframe for each sample
+# We have a dataframe in each part of our list! What are in the columns? 
+glimpse(merged_ASVs$`SRR12183139_1.fastq.gz`)
+```
+
+
+
+# Create Raw ASV Count Table 
+
+```{r raw-ASV-count-table}
+# Raw ASV
+raw_ASV_table <- makeSequenceTable(merged_ASVs)
+
+# Intuition Check: Type and dimensions of the data
+dim(raw_ASV_table)
+typeof(raw_ASV_table)
+class(raw_ASV_table)
+
+# write out raw_asv_table 
+write.table(raw_ASV_table, file = "data/01_DADA2/raw_ASV_counts.tsv",
+            sep = "\t", quote = FALSE, col.names = NA)
+```
+
+# Assess ASV Quality 
+
+## What are the current ASV lengths? 
+
+First, let's inspect the distribution of the ASV sequence lengths across all of the ASVs that we have inferred. First, we need to consider: **What is the expected length of the ASVs?** 
+
+1. *What is the sequencing strategy?*
+    - paired-end 250bp (2x250bp) Illumina MiSeq Sequencing was used.
+    - Specifically, the V4 hypervariable region of the 16S rRNA gene was targeted for sequencing with the 515F and 806R primers. 
+2. *What's the total length of our starting amplicons?* 
+    - Our primers are named after the location they bind to on the 16S gene. So: 
+    - `806 - 515 = 291` 
+    - The total length of the starting amplicon is 291 base pairs, with primers.
+3. *What is the ASV length without primers?* 
+    - The 515F (`GTGYCAGCMGCCGCGGTAA`) primer is 19 base pairs. 
+    - The 806R (`GGACTACNVGGGTWTCTAAT`) primer is 20 base pairs. 
+    - `291 - 19 - 20 = 252` 
+    - The expected ASV length without primers is **252 base pairs**. 
+4. *What is the length of the trimmed ASVs after `filterAndTrim()`?* 
+    - In our `01_QualityTrimming.Rmd`, we used `trimLeft = (19,20)` to remove the primers at the beginning of the forward read and `truncLen = c(225, 200)` to cut off base reads with declining quality.
+    - Forward: `225 - 19 = 206`
+    - Reverse: `200 - 20 = 180`
+5. *What is the overlap between our forward and reverse reads?*
+    - We performed 2x250 paired-end Illumina MiSeq Sequencing. However, from our multiQC report, we can see that our read length is actually 251 bp. 
+    - We had a total read length of 301 bp from multiQC, but excluding primers, the length should be 252 bp. This will be completely covered by the combined/overlapping length of the forward and reverse primers (100%).
+
+### ASV Length Stats 
+
+```{r assess-ASV-length}
+# Calculate summary stats
+# Longest ASV?
+maxLength_ASV <- max(nchar(getSequences(raw_ASV_table)))
+
+# Shortest ASV?
+minLength_ASV <- min(nchar(getSequences(raw_ASV_table))) 
+
+# Mean ASV length?
+meanLength_ASV <- mean(nchar(getSequences(raw_ASV_table))) 
+
+# Median ASV length?
+medianLength_ASV <- median(nchar(getSequences(raw_ASV_table))) 
+
+# Create a table to Inspect the distribution of sequence lengths of all ASVs in dataset 
+table(nchar(getSequences(raw_ASV_table)))
+```
+
+In the table above, we can see that we actually have quite the ASV sequence length distribution! There are some longer ASVs that are clearly spurious... we need to be **skeptical**! We see that the most abundant ASV length is 253, which has order an of magnitude more ASVs than compared to any other length. Since the difference in ASV abundance at 253 is so much higher than any other ASV length, we will remove ASVs that are not 253 bp. 
+
+Here's some of the stats that we've calculated:
+
+- Max ASV length: `r maxLength_ASV` base pairs
+- Min ASV length: `r minLength_ASV` base pairs
+- Mean ASV length: `r meanLength_ASV` base pairs
+- Median ASV length: `r medianLength_ASV` base pairs
+
+However, the median length actually is about what we are expecting, which is great. *Let's take a look at what this looks like graphically!*
+
+### ASV Length Plot 
+
+Now, we will plot these ASV lengths to give us a better idea: 
+
+```{r ASV-lengths-plot}
+# Inspect the distribution of sequence lengths of all ASVs in data set 
+# AFTER TRIM
+plot_ASVLength_raw <- 
+  data.frame(Seq_Length = nchar(getSequences(raw_ASV_table))) %>%
+  ggplot(aes(x = Seq_Length )) + 
+  geom_histogram() + 
+  # include the x-axis scales
+  scale_x_continuous(limits = c(0, maxLength_ASV + 5)) + 
+  labs(y = "Number of ASVs", x = "Raw ASV Length (bps)")
+
+# Show the plot
+plot_ASVLength_raw
+```
+
+As we saw in the table, the length of the ASVs is mostly 253 base pairs. 
+
+<span style="color: red;">INTERPRETATION #2:  The ASV length data doesn't exactly match the hypotheses from INTERPRETATION #1. The expected length is 252 bp, while most reads are clustering at 253 bp (orders of magnitude larger than any other length). Whie not an exact match, it is pretty close. I'm not exactly where that extra base is coming from though. </span>
+
+
+***
+
+<span style="color: red;">INTERPRETATION #3: Taking into account INTERPRETATIONS #1 and #2, what is your suggested trimming procedure for your ASV lengths? Will you allow some variation or trim to an exact length, similar to our in class example here? For trimming, although there likely soome are spurious ASVs, there is a significant portion of reads that are one or two bases over. I'll be slightly more generous than the class example, and trim ASVs are that not in the 252-256 range. </span>
+
+## Trim ASV lengths 
+
+Now that we are pretty convinced that we have some spurious ASVs, we will trim ASVs that are not in the 252-256 range in this data set. 
+
+**NOTE:** This is another moment in our workflow where we are sub-setting only the "good parts" of our data to ensure the data quality we have at the end is the best of our ability based on the sequencing run. 
+
+*Let's trim the ASVs to only be the right size, which is 252-256!* 
+
+```{r trim-ASVs}
+# Subset only ASVs that are 245 bps long 
+raw_ASV_table_trimmed <- 
+  raw_ASV_table[,nchar(colnames(raw_ASV_table)) %in% seq(252, 256)]
+
+# Inspect the distribution of sequence lengths of all ASVs in dataset 
+table(nchar(getSequences(raw_ASV_table_trimmed)))
+
+# What proportion of total ASV sequences are left in the data? 
+percRetained_Trimmed <- sum(raw_ASV_table_trimmed)/sum(raw_ASV_table)
+percRetained_Trimmed # Show it 
+
+# Inspect the distribution of sequence lengths of all ASVs in dataset 
+# AFTER TRIM
+plot_ASVLength_trimmed <- 
+  data.frame(Seq_Length = nchar(getSequences(raw_ASV_table_trimmed))) %>%
+  ggplot(aes(x = Seq_Length )) + 
+  geom_histogram() + 
+  # include the x-axis scales
+  scale_x_continuous(limits = c(0, maxLength_ASV + 5)) + 
+  labs(y = "Number of ASVs", x = "Trimmed ASV Length (bps)")
+
+# Show the plot 
+plot_ASVLength_trimmed
+```
+
+
+# Remove Chimeras
+
+## What is a chimera? 
+
+In 16S rRNA gene sequencing, a **chimera** is an artificial DNA sequence that forms when two or more different DNA templates are mistakenly and erroneously fused together during PCR amplification. **Chimeric sequences do not represent real organisms and must be removed during data processing to avoid false species identifications!** Chimeras are natural artifacts in PCR, especially in high-cycle (>25 cycle) PCR reactions, which are typical in library preparation and sequencing workflows. They arise during: 
+
+1. *Incomplete Extension in Early PCR Cycles.* During early PCR cycles, a DNA fragment may partially amplify before the polymerase detaches. This incomplete product remains in the reaction mixture.
+2. *Template Switching in Later PCR Cycles.* In subsequent cycles, the polymerase may bind to and extend a different but similar template, rather than the original one. This results in a hybrid (chimeric) DNA molecule made of two unrelated 16S rRNA gene fragments.
+3. *There is increased chimera formation in high-diversity samples.* More diverse microbial communities increase the chance of chimeric formation due to similar overlapping sequences in the sample. Longer PCR extension times and too many PCR cycles (>30) increase chimera formation by allowing more template switching.
+
+## Chimeras must be removed 
+
+- **Chimeras create false ASVs:** Chimeric sequences do not belong to any real microbial species, leading to artificial diversity in sequencing results.
+- **Chimeras can mislead ecological interpretations** If not removed, they can inflate richness estimates and misrepresent community composition.
+
+Therefore, chimera removal is an essential step in the analysis of 16S sequencing data to improve the accuracy of downstream analyses, such as taxonomic assignment and diversity assessment. It helps to avoid the inclusion of misleading or spurious sequences that could lead to incorrect biological interpretations. 
+
+```{r rm-chimeras, fig.width=3.5, fig.height=3}
+# Remove the chimeras in the raw ASV table
+noChimeras_ASV_table <- 
+  removeBimeraDenovo(raw_ASV_table_trimmed, 
+                     method="consensus", 
+                     multithread = n_threads, 
+                     verbose=TRUE)
+
+# Check the dimensions
+dim(noChimeras_ASV_table)
+
+# What proportion is left of the sequences? 
+# Chimera removal compared to trimming 
+percRetained_chimerasTrimmed <- sum(noChimeras_ASV_table)/sum(raw_ASV_table_trimmed)
+# Chimera removal compared to raw  
+percRetained_chimerasRaw <-sum(noChimeras_ASV_table)/sum(raw_ASV_table)
+
+# Plot it 
+plot_ASVLength_NoChimeras <- 
+  data.frame(Seq_Length_NoChim = nchar(getSequences(noChimeras_ASV_table))) %>%
+  ggplot(aes(x = Seq_Length_NoChim )) + 
+  geom_histogram()+ 
+  # include the x-axis scales
+  scale_x_continuous(limits = c(0, maxLength_ASV + 5)) + 
+  labs(y = "Number of ASVs \n (Post-Chimera Removal)", 
+       x = "ASV Length (bps)")
+
+# Show the plot
+plot_ASVLength_NoChimeras 
+```
+
+Let's review what proportion of ASVs we have retained along the workflow: 
+
+1. `r round(percRetained_Trimmed * 100, digits = 2)`% of the raw ASVs were retained *after trimming*.
+2. `r round(percRetained_chimerasTrimmed *100, digits = 2)`% of the trimmed ASV counts were retained *after chimera removal*.
+3. This translates to `r round(percRetained_chimerasRaw *100, digits=2)`% retention of the original, raw merged ASV counts after *both trimming and chimera removal.*
+
+So, there is good retention of the ASVs after length trimming and chimera removal, especially because there is no variation in read length allowed in this dataset. 
+
+<span style="color: red;">INTERPRETATION #4: (1) What proportion of raw ASVs were retained after trimming? 98.3% (2) What proportion of the trimmed ASVs were retained after chimera removal? 96.7% (3) What proportion of the total merged ASVs were retained after both trimming and chimera removal? 95%. I think the ASV lengths have been trimmed adequately, removing about 1/20 of the reads. Any more trimming would result in too much data being discarded. </span> 
+
+### Plot ASV Lengths 
+
+```{r plot-ASVLengths, fig.height=2.5, fig.width=7}
+plot_ASVLength_raw + plot_ASVLength_trimmed + plot_ASVLength_NoChimeras + 
+    plot_annotation(tag_levels = 'A')
+```
+
+
+# Track the read counts
+
+Here, we will look at the number of reads that were lost in the filtering, denoising, merging, and chimera removal. 
+
+```{r track-reads, fig.width=6, fig.height=4}
+# A little function to identify number seqs 
+getN <- function(x) sum(getUniques(x))
+
+# Make the table to track the seqs 
+track <- cbind(sapply(dada_forward, getN),
+               sapply(dada_reverse, getN),
+               sapply(merged_ASVs, getN),
+               rowSums(noChimeras_ASV_table))
+
+head(track)
+
+# Update column names to be more informative (most are missing at the moment!)
+colnames(track) <- c("denoisedF", "denoisedR", "merged", "nochim")
+rownames(track) <- row.names(noChimeras_ASV_table)
+
+# Generate a dataframe to track the reads through our DADA2 pipeline
+track_counts_df <- 
+  track %>%
+  # make it a dataframe
+  as.data.frame() %>%
+  rownames_to_column(var = "sample_names")
+
+# Now let's add a column for the number of ASVs
+# First, intuition check that the samples match 
+stopifnot(track_counts_df$sample_names == row.names(noChimeras_ASV_table))
+
+# Now, let's add a new column with the number of ASVs
+track_counts_df <- 
+  track_counts_df %>%
+  mutate(num_ASVs = rowSums(noChimeras_ASV_table > 1))
+
+# Visualize it in table format 
+DT::datatable(track_counts_df)
+
+# Plot it!
+track_counts_df %>%
+  pivot_longer(denoisedF:nochim, names_to = "read_type", values_to = "num_reads") %>%
+  mutate(read_type = fct_relevel(read_type, "denoisedF", "denoisedR", "merged", "nochim")) %>%
+  ggplot(aes(x = read_type, y = num_reads, fill = read_type)) + 
+  geom_line(aes(group = sample_names), color = "grey") + 
+  geom_point(shape = 21, size = 3, alpha = 0.8) + 
+  scale_fill_brewer(palette = "Spectral") + 
+  labs(x = "Filtering Step", y = "Number of Sequences") + 
+  theme_bw()
+```
+
+Now, let's plot the number of sequences that have been maintained in our samples using `geom_histogram()`. 
+
+```{r numSeqsASV-plot, fig.height=2.5, fig.width=7}
+plot_ReadDepth <- 
+  track_counts_df %>%
+  ggplot(aes(x = nochim)) + 
+  geom_histogram() + 
+  labs(x = "Total # of Sequences", y = "# of Samples") + 
+  theme_bw()
+
+# What is the ASV richness per sample? 
+plot_ASVRichness <- 
+  track_counts_df %>%
+  ggplot(aes(x = num_ASVs)) + 
+  geom_histogram() + 
+  labs(x = "Total # of ASVs", y = "# of Samples") + 
+  theme_bw()
+
+# Now, let's look at the relationship of ASVs and Sequencing depth 
+plot_ReadDepth_ASVRichness <- 
+  track_counts_df %>%
+  ggplot(aes(x = nochim, y = num_ASVs)) + 
+  geom_point() + 
+  labs(x = "Total # of Sequences", y = "# of ASVs") + 
+  theme_bw()
+
+# Show the plots together 
+plot_ReadDepth + plot_ASVRichness + plot_ReadDepth_ASVRichness + 
+    plot_annotation(tag_levels = 'A')
+```
+
+The figure above consists of three plots that summarize sequencing depth, ASV richness, and their relationship after DADA2 processing of 16S rRNA gene sequencing data.
+
+**Panel A: Read Depth after DADA2:** Histogram of sequencing depth per sample (Total # of Sequences)
+
+- The distribution is roughly unimodal, centered around 20,000–40,000 reads per sample.
+- Some samples have very low read counts (~0 reads)
+- A couple of other samples have higher sequencing depth (>50,000 reads).
+
+**Panel B: ASV Richness after DADA2:** Histogram of ASV richness (Total # of ASVs per sample)
+
+- Trimodal distribution Most samples have ~500-1000 ASVs.
+- Some samples have very low ASV counts (~0)
+
+**Panel C: Read Depth vs ASV Richness:** Scatter plot showing the relationship between sequencing depth and ASV richness.
+
+- Generally there might be a positive correlation, where samples with higher read depth tend to have more ASVs. This helps show the importance of rarefaction!
+- A few points deviate, particularly samples with low read depth and low ASVs, which could indicate sequencing failures, poor-quality samples, and/or negative controls.
+
+**Overall Interpretation & Considerations**
+
+1.	*Sequencing depth variation*: Most samples cluster around a common sequencing depth, but at least one sample is definitely under-sequenced.
+2. *ASV richness follows read depth trends*: Low sequencing depth samples have lower ASV richness, potentially biasing ecological interpretations.
+3.	*Rarefaction or normalization may be needed*: The right plot suggests that richness estimates are influenced by read depth, so rarefying or using appropriate statistical corrections will be necessary for comparative analysis.
+
+<span style="color: red;">INTERPRETATION #5: What conclusions can you draw from each of the three individual plots above? Please note anything important that the figure might indicate regarding your project data. Are there any specific notes and considerations for later?</span> 
+
+
+# Assign Taxonomy 
+
+Here, we will use the **silva database version 138.2**, which has been properly formatted for DADA2. The files came from this [DADA2-formatted reference databases website](https://benjjneb.github.io/dada2/training.html), which hosts several other reference taxomoy files for several popular taxonomic databases. 
+
+In this example, we are going to use the database that is pre-downloaded to the server at the following path: `/workdir/in_class_data/taxonomy/`. You are welcome to symbolically link the taxonomy files, however note that they are VERY LARGE. So, it is actually suggested here (for this one time) to use the absolute path here. However, we need to note that this would break our reproducibility! 
+
+## How does the taxonomy work? 
+
+The `assignTaxonomy` function  implements the Ribosomal Database Project (RDP) Naive Bayesian Classifier algorithm described in Wang et al. (2007), published in Applied and Environmental Microbiology, with a kmer size of 8 and 100 bootstrap replicates. 
+
+```{r assign-tax}
+# Assign up to genus level 
+taxa_train <- 
+  assignTaxonomy(noChimeras_ASV_table, 
+                 refFasta = "/workdir/in_class_data/taxonomy/silva_nr99_v138.2_toGenus_trainset.fa.gz", 
+                 multithread = n_threads)
+
+# Add the genus/species information 
+taxa_addSpecies <- 
+  addSpecies(taxa_train, 
+              refFasta = "/workdir/in_class_data/taxonomy/silva_v138.2_assignSpecies.fa.gz")
+
+# Inspect the taxonomy 
+glimpse(taxa_addSpecies) # Note that the rownames are the ASV sequences!
+# Let's removing the ASV sequence rownames for display only
+taxa_print <- taxa_addSpecies 
+rownames(taxa_print) <- NULL
+head(taxa_print)
+#View(taxa_print)
+```
+
+
+# Export the Data
+
+Remember from the beginning of the file under "Goals", we wanted to export 4 different types of information: 
+
+1. ASV Count Table: `asv_table` (with and without sequence names)
+2. ASV fasta file: `asvs_fasta` for building a phylogenetic tree at a later step.
+3. Taxonomy Table  `tax_table`
+4. Sample Information: `sample_data`  track the reads lots throughout DADA2 workflow. 
+
+
+## 1. ASV Tables
+
+We will export the following two ASV count tables, which will be in "long" format where the **ASVs are in rows** and the **sample names are in the columns.**
+
+1. **With ASV seqs:** ASV headers include the *entire* ASV sequence 245 bases.
+2. **with ASV names:** This includes re-written and shortened headers like ASV_1, ASV_2, etc, which will match the names in our fasta file below.
+
+### Structure of ASV tables
+
+Let's check that the ASVs are in the rows and the sample names are in the columns. If not, we can use the transpose function `t()` in R. 
+
+```{r structure-ASV-table}
+# What's the current format of the ASV table?
+head(rownames(noChimeras_ASV_table)) # Samples!
+head(colnames(noChimeras_ASV_table)) # ASV Sequences
+
+# Therefore, we need to transpose the matrix 
+final_ASV_table_withSeqs <- t(noChimeras_ASV_table)
+
+# Intuition check
+head(rownames(final_ASV_table_withSeqs)) # ASV Sequences
+head(colnames(final_ASV_table_withSeqs)) # Sample names
+```
+
+### Names in ASV tables
+
+#### Fix Sample Names 
+
+Notice above that the sample names are actually file names. Let's fix this! 
+
+> WARNING! This is an easy place where a silent error can step in where we could misname our samples, leading to catastrophe down the road. So, we need to be very careful and complete our checks and balances so we ensure the samples are not mixed up in the renaming process. 
+
+```{r SampleNames-ASV-table}
+# Remember at the top of the file we created a vector of sample names 
+head(sample_names)
+# Let's check with the actual column names 
+head(colnames(final_ASV_table_withSeqs)) # Sample names
+# And then apply our sample name script to check, too
+head(sapply(strsplit(colnames(final_ASV_table_withSeqs), "_"), `[`,1)) # Looks good! 
+
+# Now, add a break in the script break if this isn't true! 
+# Let's make sure the sample names match the file names in the matrix.
+stopifnot(sapply(strsplit(colnames(final_ASV_table_withSeqs), "_"), `[`,1) == sample_names)
+
+# Now, we've done some checks to prove to ourselves there will be no silent errors, 
+# Let's rename! 
+colnames(final_ASV_table_withSeqs) <- sample_names
+head(colnames(final_ASV_table_withSeqs))
+```
+
+#### Rename ASVs
+
+Then, we can also fix the names of our ASVs for our second ASV table where we will replace the ASV sequence names with ASV_1, ASV_2
+
+```{r prepare-ASVcount-Seqtable}
+# Give headers more manageable names
+# First pull the ASV sequences from the rownames
+ASV_seqs <- rownames(final_ASV_table_withSeqs)
+ASV_seqs[1:5]
+
+# How many ASVs? 
+num_ASVs <- dim(final_ASV_table_withSeqs)[1] # select the number of rows
+num_ASVs 
+
+# Make an empty vector the length of the number of ASVs, 
+# which is where we will place the new operational ASV names 
+ASV_headers <- vector(num_ASVs, mode = "character")
+
+# Let's mae sure we have an empty vector!
+ASV_headers[1:5]
+length(ASV_headers) # looks good! 
+
+# Now, let's create a vector with ASV numbers
+# loop through vector and fill it in with ASV names 
+for (i in 1:num_ASVs) {
+  # Add leading zero to ASV name so they print in correct order.
+  ASV_number <- sprintf("%04d", i)
+  # Now, rename each spot in the ASV header vector as we loop through the for loop
+  ASV_headers[i] <- paste(">ASV", ASV_number, sep = "_")
+}
+
+# Intuition check
+ASV_headers[1:5]
+
+# Create a new ASV table, which will have the ASV numbers as names 
+# View(noChimeras_ASV_table) # To view the table
+final_ASV_table <- final_ASV_table_withSeqs
+glimpse(final_ASV_table)
+
+## Replace the ASV seqs with the ASV numbers 
+row.names(final_ASV_table) <- sub(">", "", ASV_headers)
+final_ASV_table[1:5, 1:5]
+#View(final_ASV_table) # To view the table
+``` 
+
+### Write the ASV Tables!
+
+1. **With ASV seqs:** ASV headers include the *entire* ASV sequence 245 bases.
+2. **with ASV names:** This includes re-written and shortened headers like ASV_1, ASV_2, etc, which will match the names in our fasta file below.
+
+```{r write-asv-tables}
+# 1. Write count table with ASV sequence names
+write.table(final_ASV_table_withSeqs, 
+            file = "data/01_DADA2/ASV_table_withSeqNames.tsv", 
+            sep = "\t", quote = FALSE, col.names = NA)
+
+# 2. Write count table with ASV numbered names (e.g. ASV_1, ASV_2, etc)
+write.table(final_ASV_table, 
+            file = "data/01_DADA2/ASV_table.tsv", 
+            sep = "\t", quote = FALSE, col.names = NA)
+```
+
+
+## 2. ASV Fasta File 
+
+Now, let's create a fasta file that has our ASV numbers with each of their corresponding ASV sequences. This file needs to be created because we will use it later to build a phylogenetic tree. 
+
+**Why do we need a phylogenetic tree?** Many widely used microbial ecology metrics rely on phylogenetic relationships to quantify community similarity. For example, there are phylogenetic alpha-diversity metrics like the [phylogenetic Hill Numbers](https://www.annualreviews.org/content/journals/10.1146/annurev-ecolsys-120213-091540) and also beta-diversity measures that incorporate the branch lenghts of phylogenetic trees as it relates to community dissimimlarity, [like the abundance-unweighted and abundance-weighted UniFrac dissimilarity metrics](https://journals.asm.org/doi/full/10.1128/aem.71.12.8228-8235.2005). These metrics consider species presence and their evolutionary distances, conveying relationships of communities through an ecological *and* evolutionary framework. 
+
+### Write the ASV Fasta File
+
+```{r write-asv-fastas}
+# Let's take our asv_headers
+head(ASV_headers, n = 2)
+# And combine it with their sequences
+head(ASV_seqs, n = 2)
+
+# Combine in a fasta format with the cbind() function
+ASV_fasta <- c(rbind(ASV_headers, ASV_seqs))
+head(ASV_fasta, n = 4)
+
+# Then, let's write it to a fasta file!
+# This will be our reference later on for which seq matches which ASV
+write(ASV_fasta, "data/01_DADA2/ASVs.fasta")
+```
+
+## 3. Taxonomy Table 
+
+Before we actually write the taxonomy table, let's put the ASV sequences as another column in our taxonomy table and then replace the rownames to be our numbered ASV names. 
+
+### Reformat Taxonomy 
+
+1. Move ASV sequences to column 
+2. Replace ASV rownames with ASV numbered names
+
+> WARNING! This is another easy place where a silent error can step in!! Here, we could accidentally misname our ASVs. So, we need to be very careful and perform intuition checks to ensure that the ASV names are not mixed up in the renaming process. 
+
+```{r reformat-tax-table}
+# Inspect the taxonomy table
+dim(taxa_addSpecies) # ASVs are in rows and Kingdom, Phylum, etc in Columns 
+colnames(taxa_addSpecies) # Column names are Linnean Taxonomy 
+head(rownames(taxa_addSpecies), n = 2) # ASV names are rownames 
+class(taxa_addSpecies) # Character matrix
+
+##### Prepare tax table 
+# 1. Add the ASV sequences from the rownames to a column 
+new_tax_table <- 
+  taxa_addSpecies%>%
+  as.data.frame() %>%
+  rownames_to_column(var = "ASVseqs") 
+
+# Intuition check 
+glimpse(new_tax_table)
+
+# IMPORTANT! Let's do our intuition check 
+# This is where we ensure we don't mix up the ASV names!
+stopifnot(new_tax_table$ASVseqs == rownames(final_ASV_table_withSeqs))
+
+# Now let's add the ASV names 
+rownames(new_tax_table) <- rownames(final_ASV_table)
+head(new_tax_table)
+
+### Final prep of tax table. Add new column with ASV names 
+ASV_tax_table <- 
+  new_tax_table %>%
+  # add rownames from count table for phyloseq handoff
+  mutate(ASV = rownames(final_ASV_table)) %>%
+  # Reorder the columns
+  dplyr::select(Kingdom, Phylum, Class, Order, Family, Genus, Species, ASV, ASVseqs)
+
+# Assign the rownames, which is required by phyloseq
+rownames(ASV_tax_table) <- ASV_tax_table$ASV
+
+# Take a quick look
+glimpse(ASV_tax_table)
+
+# Intution check
+stopifnot(ASV_tax_table$ASV == rownames(ASV_tax_table), 
+          rownames(ASV_tax_table) == rownames(ASV_tax_table))
+```
+
+### Write the Taxonomy Table 
+
+Now, let's write out the taxonomy table 
+
+```{r write-tax-table}
+# Write the table 
+write.table(ASV_tax_table, 
+            file = "data/01_DADA2/ASV_taxonomy.tsv", 
+            sep = "\t", quote = FALSE, col.names = NA)
+```
+
+
+## 4. Sample Data 
+
+Let's save the `track_counts_df`, which can be useful for downstream analyses. 
+
+```{r save-track reads}
+# And save the track_counts_df a R object, which we will merge with metadata information in the next step of the analysis in nalysis/02_Taxonomic_Assignment. 
+save(track_counts_df, file = "data/01_DADA2/track_read_counts.RData")
+```
+
+# Final info for Reproducibility 
+
+## Session Information
+
+```{r session-info}
+# Ensure reproducibility with package version information
+devtools::session_info()
+```
