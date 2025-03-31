@@ -1,0 +1,486 @@
+---
+title: "Pruning & Rooting Phylogenetic Trees with ggTree"
+author: "Antone Jung"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    code_folding: show
+    theme: spacelab
+    highlight: pygments
+    keep_md: no
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+      toc_depth: 3
+  keep_md: true  
+editor_options: 
+  chunk_output_type: console
+---
+
+# Goals 
+
+1. Load the [FastTree2](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0009490) unrooted tree that we calculated in `analysis/04A_Phylogenetic_Tree_Construction.Rmd` and `raw_preprocessed_physeq``.  
+2. Merge the unrooted tree to the `raw_preprocessed_phyloseq` object.  
+3. Visualize and inspect tree with [ggtree](https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/2041-210X.12628).
+4. Evaluate long branches & prune ASVs, if needed. *If your dataset has long branches, you will need to do this before rooting!!*
+5. After pruning, root the tree, ideally within the Archaea and, if not, mid-root the tree.
+6. Combine the new, rooted tree with the phyloseq object. 
+7. Save 2 phyloseq objects: 1. Unrooted tree phyloseq object, 2. Rooted tree phyloseq object. 
+
+## Inputs 
+
+1. Our previously pre-processed phyloseq object that has chloroplasts, mitochondria, reverse complements, and negative controls removed, which is located in `data/03_PreProcessing/raw_preprocessed_physeq`.
+2. The raw, unrooted maximum liklihood tree that we generated using  [FastTree2](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0009490), which is located in `data/04_PhylogeneticTree/ASVs_unrooted.tree`
+
+## Outputs 
+
+1. The output of this file will be a S4 phloseq objected called `phytree_preprocessed_physeq`, which we will save to `data/04_PhylogeneticTree/`. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      fig.align = "center",
+                      # Always relevant to the document directory 
+                      # send any figure output to this folder 
+                      fig.path = "../figures/04_PhylogeneticTree/",
+                      warning = FALSE) 
+```
+
+# Before you start
+
+## Set my seed 
+```{r set-seed}
+# Any number can be chosen 
+set.seed(10202005)
+```
+
+## Load Packages 
+```{r load-packages}
+pacman::p_load(tidyverse, phyloseq, ggtree, phytools, tidytree, phylobase,
+               install = FALSE)
+```
+
+## 1. Load Data files 
+```{r load-data}
+# Preprocessed phyloseq object 
+load("data/03_PreProcessing/raw_preprocessed_physeq.RData")
+
+# Inspect the phyloseq object 
+raw_preprocessed_physeq
+
+# Load in the tree! 
+unrooted_tree <- read.tree("data/04_PhylogeneticTree/ASVs_unrooted.tree")
+
+# Take a look at the tree
+unrooted_tree
+str(unrooted_tree)
+```
+
+# 2. Merge Unrooted Tree & `raw_preprocessed_physeq`
+
+Now that we've loaded in both our `raw_preprocessed_physeq` and the unrooted tree, let's merge them into one phyloseq object that can be used to plot the tree with ggtree. 
+
+
+```{r merge-physeq}
+# Intuition check 
+stopifnot(ntaxa(raw_preprocessed_physeq) == ntaxa(unrooted_tree))
+# No news is good news! 
+
+# Merge the tree with the phyloseq object 
+unrooted_physeq <- 
+  merge_phyloseq(raw_preprocessed_physeq, unrooted_tree)
+
+# Let's take a look! 
+unrooted_physeq
+```
+
+
+# 3. Visualize and inspect tree with [ggtree](https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/2041-210X.12628).
+
+Now, let's take a look 
+
+## Kingdom Level Tree
+
+```{r plot-tree-unrooted, fig.width=4.5, fig.height=7}
+# Make a basic tree with the domains 
+kingdom_tree <- 
+  ggtree(unrooted_physeq) + 
+  # color tips by kingdom
+  geom_tippoint(mapping = aes(color = Kingdom)) + 
+  # add a title
+  labs(title = "Unrooted Tree") + 
+  scale_color_manual(values = c("firebrick3", "cornflowerblue", "grey")) + 
+  # Move the legend to the bottom of the tree 
+  theme(legend.position = "bottom")
+
+# Look at it 
+kingdom_tree
+
+# Check if tree is rooted
+is.rooted(unrooted_tree) # should be TRUE
+```
+
+In the above unrooted tree, we can see all of the Archaea fall within the bacteria. Huh?! This **does not make evolutionary sense!** Therefore, we will need to **root** the tree to fix this. *But what does it mean to root the tree, you ask???* We will get to this in a minute! 
+
+### Do you expect to have Archeaea? 
+
+Regions of the 16S rRNA gene are better/worse for amplifying archaea that might be present in our samples. If you're wondering more, please check out this [2021 Annual Reviews of Microbiology paper by Tahon et al](https://www.annualreviews.org/content/journals/10.1146/annurev-micro-040921-050212), specifically Figure 2 and the tables. What I've learned about archaea over the years is: 
+
+- Better regions for Archaeal Detection: 
+    - V4 or V4–V5 (e.g., 515F-Y / 806R-B or 926R): Improved archaeal coverage (including Thaumarchaeota and Euryarchaeota) compared to older V4-only approaches due to primer updates by [Parada et al., 2015](https://journals.asm.org/doi/10.1128/msystems.00009-15) and [Aprill et al., 2016](https://www.int-res.com/abstracts/ame/v75/n2/p129-137/), captures both Bacteria and Archaea reasonably well and provides the best balance for broad community surveys
+- Caution with these regions
+    - [Original V4 primers (515F/805R)](https://www.pnas.org/doi/10.1073/pnas.1000080107?url_ver=Z39.88-2003&rfr_id=ori%3Arid%3Acrossref.org&rfr_dat=cr_pub++0pubmed): Common and well-supported for Bacteria BUT original 515F underrepresents Thaumarchaeota, a key archaeal group in soils, oceans, and freshwater. 
+    - V3–V4 (e.g., 341F / 805R): Popular due to high taxonomic resolution for Bacteria but biased against Archaea in most environmental samples—specifically, some archaeal groups lack primer binding sites in this region. 
+    - V6–V8 or V7–V9: Rarely used for Archaea (less common for bacteria, too), region is less conserved across archaeal groups, Low coverage unless paired with archaeal-specific primers.
+
+In summary: 
+
+### Summary: Hypervariable Region Selection for Archaea
+
+| Region     | Coverage of Archaea | Notes                                            |
+|------------|---------------------|--------------------------------------------------|
+| V4–V5      | ✅ Good              | Best for mixed Bacteria + Archaea               |
+| V3–V5      | ✅ Good              | Broad, longer amplicon (good with 2×300 bp)     |
+| V4 only    | ⚠️ Moderate          | Use [515F-Y](https://journals.asm.org/doi/10.1128/msystems.00009-15) instead of original 515F         |
+| V3–V4      | ❌ Poor              | Biased toward Bacteria                          |
+| V6–V8      | ❌ Poor              | Not recommended for general use                 |
+
+*Ok, now that we've considered the archaea, let's think about the branches in our tree!* 
+
+# 4. Long Branches? 
+
+Now, let's think about the quality of our tree. Evaluate that kingdom tree above...
+
+**Do you have any long branches in your tree?** If so, you will need to prune your ASVs. This becomes especially important if your dataset does not have Archaea (*e.g.,* looking at you 341F V3 primers!) especially if you do not have Archaea and will need to 
+
+<span style="color: red;">INTERPRETATION #1: There's a very strange branch with primarily eukaryotes and NA, which is weird b/c I didn't think 16S primers would amplify eukaryotic DNA.</span>
+
+Before we move onto rooting, this is where we need to assess if we have any long and wonky branches! 
+
+
+## 4a. Evaluate Long Branches
+
+This part will get a little manual, however, this is an important step along the way to ensure that we are feeling certain that our data quality is good. 
+
+### Kingdom Tree with Node Labels 
+
+Let's put labels on our tree so we have a bit more flexibility
+
+```{r kingdom-node-tree, fig.width=4.5, fig.height=7}
+kingdom_node_tree <- 
+  kingdom_tree + 
+  # Add the node label 
+  geom_text(aes(label=node), hjust= -0.5, vjust = -0.3, size = 2, angle = 90)
+
+# Plot the tree
+kingdom_node_tree
+```
+
+In the phylogeny above, it looks like **node #7169** is quite long. Otherwise, things look mostly ok. 
+
+
+### Evaluate node #7169
+
+```{r evaluate-long-branches-703}
+# View a specific clade
+# Zoom in on node that looks potentially suspicious
+viewClade(kingdom_node_tree + 
+          labs(title = "Kingdom Tree: Node 7169"), 
+          node = 7169)
+
+# This plot is too zoomed in! Let's try to zoom out by looking at ancestors
+# Lets see its ancestors, which will tell us each node as it steps up. 
+# It's ideal to look a couple nodes up but not too far!
+tidytree::ancestor(unrooted_tree, 7169) # The input is the TREE, not phyloseq!!
+
+# Let's evaluate 16155!!
+viewClade(kingdom_node_tree, 16517) # even more zoomed out
+```
+
+In the subtree above, 7169 is one of the end points of a tree rooted in 16517 (the branch point for this long cluster)
+
+
+```{r pull-node703}
+# Or if there are two nodes that we can see we can find its MRCA
+## create tibble of tree to identify offspring
+tree_tib <- as_tibble(unrooted_physeq@phy_tree)
+
+# Inspect
+head(tree_tib)
+str(tree_tib)
+
+# lets look at the long branch
+mrca_node_16517 <- tidytree::MRCA(unrooted_tree, .node1 = 16517)
+
+# Inspect
+mrca_node_16517
+
+## create dataframe to view ASVs and taxa info and to pull the ASVs
+node_16517 <- 
+  offspring(tree_tib, mrca_node_16517, tiponly = TRUE) %>% 
+  as.data.frame() %>% 
+  pull(label)
+
+# Inspect
+node_16517
+
+# Now, let's pull out the taxonomy information, including the ASV sequence!
+node_16517_df <- 
+  unrooted_physeq %>%
+  tax_table() %>%
+  as.data.frame() %>% 
+  filter(ASV %in% node_16517) 
+
+# Take a look: 
+glimpse(node_16517_df)
+
+# look at counts of the ASVs
+unrooted_physeq %>%
+  subset_taxa(., ASV %in% node_16517_df$ASV) %>%
+  otu_table() %>%
+  data.frame() %>%
+  colSums()
+
+# Lets BLAST our sequences to investigate if they are real or not
+node_16517_df 
+```
+
+Interesting! We can already conclude a few things: 
+
+- There are VERY FEW counts! 
+- Mostly Eukaryotic
+
+Both of these conclusions make us skeptical of these ASVs!
+
+# BLAST
+
+## What to look for with BLAST Results? 
+
+If you're identifying a sequence (like 16S rRNA or a gene):
+
+- % Identity ≥ 97% for species-level 16S match (lower for genus)
+- E-value ≤ 1e-5 (lower is better—e.g. 1e-20, 1e-50, etc.)
+- High query coverage (ideally >90%)
+- Long alignment length, especially for full genes or 16S sequences
+
+### Most Important Values in BLAST Output
+
+| Field            | What It Means                                               | Why It Matters                                       | Good Values                         |
+|------------------|--------------------------------------------------------------|------------------------------------------------------|-------------------------------------|
+| **% Identity**   | % of exact matches in aligned region                         | Measures sequence similarity                         | ≥ 97% for species (16S); lower for genus |
+| **E-value**      | Expected number of hits this good by chance                  | Lower = more statistically significant match         | ≤ 1e-5 (e.g., 1e-20, 1e-50, etc.)   |
+| **Bit Score**    | Normalized alignment score                                  | Higher = better alignment                            | > 200 for strong alignments         |
+| **Alignment Length** | Number of bases or amino acids in the aligned region     | Longer alignments are generally more reliable        | As long as possible (e.g., >250 bp for 16S) |
+| **Query Coverage** | % of your sequence aligned with the hit                   | High coverage increases confidence in identification | > 90% (ideally near 100%)           |
+| **Accession & Description** | ID and description of the matched sequence       | Tells you what the hit is and where it comes from    | Use top hit + trusted source        |
+
+## 4b. Prune your tree
+
+```{r prune-ASVs, eval = TRUE}
+# Function from Joey McMurdie: https://github.com/joey711/phyloseq/issues/652
+pop_taxa = function(physeq, badTaxa){
+  allTaxa <-  taxa_names(physeq)
+  allTaxa <- allTaxa[!(allTaxa %in% badTaxa)]
+  return(prune_taxa(allTaxa, physeq))}
+
+# Let's use the pop_taxa function :) 
+# Recreate a phyloseq object without your unwanted ASV or node
+# Lets use the example ASVs above from node_3315_df
+unrooted_physeq_rm16517 <- 
+  unrooted_physeq %>%
+  pop_taxa(., node_16517_df$ASV)
+
+# Check it 
+unrooted_physeq_rm16517
+
+# Intuition Check: How many differ???
+ntaxa(unrooted_physeq) - ntaxa(unrooted_physeq_rm16517) 
+
+# Visually inspect 
+ggtree(unrooted_physeq_rm16517) + 
+  geom_tippoint(mapping = aes(color = Kingdom))
+```
+
+
+<span style="color: red;">INTERPRETATION #2: There was a long branch that was primarily composed of Eukaryotic/Unknown origin ASVs. I don't really know how that slipped past since positive controls were removed, but it was only 24 ASVs. Since this was eukaryotic, it was fit to remove.</span>
+
+# 5. Root the Tree
+
+Now that we've pruned the trees of potentially contaminating ASVs, it's time to root! 
+
+*What does it mean to root a tree, you ask?* **Rooting a tree** means designating a specific node in a phylogenetic tree as the common ancestor of all other nodes. This establishes a direction of evolution — from the root (the oldest ancestor) to the tips (the current taxa or sequences). A tree without a root is called **unrooted**, and it only shows relationships (like how closely related things are), not the direction of descent.
+
+## Why do we root trees in microbial community analyses?
+
+In microbial ecology, rooted trees are especially useful for:
+
+1. **Calculating Phylogenetic Diversity Metrics**: Metrics like Faith’s Phylogenetic Diversity and the UniFrac distances require a rooted tree to calculate how much evolutionary history is shared between communities. Without a root, the distances between taxa don’t make biological sense in terms of lineage or shared ancestry.
+2. **Comparing Community Structure:** Rooting allows you to identify lineages that dominate or are lost between samples, trace evolutionary shifts in microbial composition, interpret ecological or functional patterns across a gradient (*e.g.,* salinity, pH, antibiotic exposure). 
+3. **Biological Interpretation** Rooted trees are required for the following interpretations, which microbial community ecologists often want to know: 
+    - *Are these microbes derived from a common ancestor?*
+    - *Do the samples diverge from a known lineage (e.g., Proteobacteria)*?
+    - *What’s the evolutionary placement of unknown organisms?*
+
+## Methods of Rooting Trees 
+
+So, **how do we root a tree**? There are two different types of methods to root a tree: 
+
+1. **Outgroup rooting:** Choose a known lineage outside your group of interest (*e.g.,* Archaea as outgroup to Bacteria). ***This is always preferred when we have a known outgroup!***
+    - *Pros:*
+        - Biologically meaningful — places the root based on known evolutionary relationships.
+        - More accurate if your outgroup is correctly chosen and aligns well.
+        - **Best for:** Hypothesis-driven studies, evolutionary interpretations, or when your dataset includes taxa from multiple domains/phyla.
+    - *Cons:* 
+        - Requires a reliable outgroup — too distant, and it can distort the tree (long-branch attraction).
+        - Not always available or appropriate (e.g., if you're only analyzing a subset of taxa without known outgroups).
+
+2. **Midpoint rooting:** Places the root at the midpoint of the longest path in the tree (useful when no clear outgroup exists). 
+    - *Pros:*
+        - Simple and automatic — no need for prior biological knowledge.
+        - Works well for diverse microbial datasets where outgroup info is unclear or unavailable.
+        - **Best for**: Exploratory analyses, diversity metrics (like UniFrac), or when working with just bacteria/just archaea and you don’t have a good outgroup.
+    - *Cons:*
+        - Assumes a molecular clock — that all lineages evolve at similar rates.
+        - Can misplace the root if there’s rate variation across branches.
+
+**In Summary:**
+
+| Rooting Method      | Best When...                                    | Pros                        | Cons                                 |
+|---------------------|--------------------------------------------------|-----------------------------|--------------------------------------|
+| **Outgroup**         | You have a well-placed, closely related outgroup | Biologically accurate       | Needs prior knowledge; may bias tree |
+| **Midpoint**         | No good outgroup; exploratory or metric-focused | Fast and automatic          | Assumes equal evolutionary rates     |
+
+**In summary:** If you're working in QIIME or another microbiome pipeline and don't have a clear outgroup, **midpoint rooting** is typically fine — especially for things like UniFrac or beta diversity. If you’re doing evolutionary or taxonomic analysis and **have a suitable outgroup, use that instead**.
+
+
+## 5a. Archaeal Root
+
+As discussed above, if you have archaea in your sample, it's best to use the outgroup method to root the tree. Since we have archaea in this dataset, we will use the outgroup method. However, below we will walk through an example of how to mid-root the tree. (*Note that midpoint rooting is not preferable when there's a clear outgroup!*)
+
+```{r archaeal-root}
+# Is the tree rooted? 
+tidytree::is.rooted(phy_tree(unrooted_physeq_rm16517))
+
+# but first find the ASVs that are Archaea
+archaeal_ASVs <- 
+  tax_table(unrooted_physeq_rm16517) %>%
+  as.data.frame() %>%
+  filter(Kingdom == "Archaea") %>%
+  pull(ASV)
+
+eukaryota_ASVs <- 
+  tax_table(unrooted_physeq_rm16517) %>%
+  as.data.frame() %>%
+  filter(Kingdom == "Eukaryota") %>%
+  pull(ASV)
+length(eukaryota_ASVs)
+eukaryota_ASVs
+
+NA_ASVs <- 
+  tax_table(unrooted_physeq_rm16517) %>%
+  as.data.frame() %>%
+  filter(Kingdom != "Eukaryota" & Kingdom != "Bacteria" & Kingdom != "Archaea") %>%
+  pull(ASV)
+length(NA_ASVs)
+
+# How many archaeal ASVs? 
+length(archaeal_ASVs)
+archaeal_ASVs
+
+# find the node that encompasses all Archaea
+archaeal_node <- 
+  phytools::findMRCA(unrooted_tree, 
+                     tips = archaeal_ASVs, type = "node") 
+
+# Inspect
+archaeal_node # node = 15246
+
+# View clade to check it out
+viewClade(kingdom_tree, archaeal_node)
+viewClade(kingdom_node_tree, archaeal_node)
+```
+
+```{r archeal-node-highligh, fig.width=4.5, fig.height=7}
+# Let's highlight! 
+node_15246 <- 
+  ggtree(unrooted_physeq_rm16517) + 
+  geom_tippoint(mapping = aes(color = Kingdom), size = 1.5) + 
+  #geom_text(aes(label = node), hjust = -0.7, vjust = -0.2, size = 2) +
+  geom_highlight(node = archaeal_node, fill = "goldenrod1") + 
+  scale_color_manual(values = c("firebrick3", "cornflowerblue", "grey"))
+
+# Visualize it 
+node_15246
+
+# Root it! 
+archaeal_rooted_tree <-
+  ape::root(phy_tree(unrooted_physeq_rm16517), 
+            node = archaeal_node, resolve.root = TRUE)
+archaeal_rooted_noEuktree <- 
+  archaeal_rooted_tree %>%
+  pop_taxa(., eukaryota_ASVs)
+
+# Check it! 
+tidytree::is.rooted(archaeal_rooted_tree)
+```
+
+Great, we have successfully rooted the tree! Now, let's plot it to also confirm this visually. 
+
+### 6a. Merge phyloseq: Archeal Rooted Tree
+
+```{r merge-archeal-root-physeq}
+# Merge with physeq 
+archaeal_rooted_physeq <- 
+  merge_phyloseq(raw_preprocessed_physeq, archaeal_rooted_noEuktree)
+```
+
+
+### Plot Archaeal Rooted Tree 
+
+```{r plot-archaeal-rooted-tree, fig.width=4.5, fig.height=7}
+# Finally let's plot it! 
+# Plot rooted simple tree with no text 
+archaeal_rooted_tree_plot <- 
+  ggtree(archaeal_rooted_physeq) + 
+  geom_tippoint(aes(color = Kingdom)) +   
+  # add a title
+  labs(title = "Archaeal Rooted Tree") + 
+  scale_color_manual(values = c("firebrick3", "cornflowerblue", "grey"))
+
+# View it! 
+archaeal_rooted_tree_plot
+
+# Plot rooted tree with text
+archaeal_rooted_node_tree_plot <- 
+  archaeal_rooted_tree_plot +
+  geom_text(aes(label = node), hjust = -0.5, vjust = -0.3, size = 1.5) 
+
+# View it! 
+archaeal_rooted_node_tree_plot
+```
+
+In the tree above, we can still see the longer branches in the dataset but we can feel good because we inspected them! :) 
+
+<span style="color: red;">INTERPRETATION #3 (If archaeal rooting): Now that the tree is rooted, the tree seems relatively finalized. I might pop off remaining Eukaryotic and N/A ASVs as they probably aren't relevant to downstream analyses, but there aren't any super long branches/outliers.</span>
+
+## 7. Save phyloseq objects
+
+### Save individual phyloseq objects
+
+Here, we will create two individual files that will each have a single phyloseq object. This is useful if we only want to work with one tree. (For example, we will move forward with the archaeal tree.) 
+
+```{r save-phyloseq-object}
+# Now, save archaeal rooted phyloseq object
+save(archaeal_rooted_physeq, 
+     file = "data/04_PhylogeneticTree/archaeal_rooted_physeq.RData")
+```
+
+Now that we have our rooted trees inside of a phyloseq object, we can go forth and begin our next analysis!
+
+# Final info for Reproducibility 
+## Session Information
+
+```{r session-info}
+# Ensure reproducibility with package version information
+devtools::session_info()
+```
