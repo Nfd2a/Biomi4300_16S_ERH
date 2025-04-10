@@ -1,0 +1,549 @@
+---
+title: "Biodiversity with different organic carbon"
+author: "Antone Jung"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document: 
+    code_folding: show
+    theme: spacelab
+    highlight: pygments
+    keep_md: no
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+      toc_depth: 3
+  keep_md: true  
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      fig.path = "../figures/05_Biodiversity/")
+```
+
+# Goals 
+
+Run an analysis on the within-sample biodiversity of the samples in our project. 
+
+1. Calculate the Hill Numbers of the samples using the iNEXT package. 
+2. Plot and evaluate the interpolated and extrapolated rarefaction curves from iNEXT. 
+3. Analyze the Hill numbers as it relates to stations and salinity (in PSU).
+4. Test and then answer the scientific question at hand! (Remember, we're doing biology!)
+
+## Inputs 
+
+1. We will need the `phytree_preprocessed_physeq`, which includes a rooted tree (ideally within the archaea!) that we created in `analysis/04B_Phylogenetic_Tree_Inspection.Rmd`. 
+
+## Outputs 
+
+*This is an exciting analysis!!! We finally get to answer one of our scientific questions!*
+
+1. Calculated biodiversity measures (Hill numbers) across every sample. 
+2. Figures to include in our scientific paper that visualize the data as it relates to the scientific question.
+3. Statistical tests conveying the measured and quantified changes and patterns in biodiversity.
+
+# Scientific Question
+
+## Question & Hypotheses
+
+How is microbial biodiversity modified across a soil organic carbon gradient?
+
+- *Null Hypothesis:* Soil microbial biodiversity (*e.g.* simpson) does not vary along an organic carbon gradient.
+- *Alternative Hypothesis:* Soil microbial biodiversity (*e.g.* simpson) will increase as organic carbon increases. There is a direct relationship between organic carbon and diversity weighted on dominant species.
+
+*Let's get to calculating Biodiversity!*
+
+# Set up the Environment 
+
+## Set the seed 
+```{r set-seed}
+set.seed(10202005)
+```
+
+## Load Packages & Colors 
+
+```{r load-packages-colors}
+# install packages for stats
+#install.packages("rstatix")
+#install.packages("ggpubr")
+
+pacman::p_load(tidyverse, devtools, patchwork, iNEXT, phyloseq,
+               # packages for stats
+               ggpubr, rstatix, install = FALSE)
+
+# Load in colors for plotting 
+source("code/colors.R")
+```
+
+## Load in Data 
+
+```{r load-data}
+load("data/04_PhylogeneticTree/archaeal_rooted_physeq.RData")
+
+# take a look at it! 
+archaeal_rooted_physeq
+
+# Intuition check on seq depth
+min(sample_sums(archaeal_rooted_physeq))
+
+# Make a metadata dataframe 
+metadata_df <- 
+  archaeal_rooted_physeq %>%
+  sample_data() %>%
+  data.frame()
+
+# view of it
+glimpse(metadata_df)
+```
+
+# Biodiversity Hill Numbers with iNEXT
+
+```{r iNEXT-biodiversity}
+# prepare the input data 
+# Species in rows and the samples in columns 
+iNEXT_input_df <- 
+  archaeal_rooted_physeq %>%
+  otu_table() %>%
+  data.frame()
+
+# Inpect 
+dim(iNEXT_input_df)
+iNEXT_input_df[1:5, 1:5]
+
+# Run iNEXT 
+# Remember to set the seed!
+# ASVs in ROWs, samples in COLUMNS 
+iNEXT_data <- iNEXT(iNEXT_input_df, 
+                    q = c(0, 1, 2),
+                    datatype = "abundance")
+```
+
+Since iNEXT takes a while to run, we will load in the data that was caluculated before! 
+
+```{r load-iNEXT-data}
+# Inspect 
+str(iNEXT_data)
+typeof(iNEXT_data)
+```
+
+
+# Rarefaction Curves 
+
+## `ggiNEXT` Rarefaction Curves 
+
+```{r iNEXT-colors}
+# Prepare Colors 
+color_df <- 
+  iNEXT_input_df %>%
+  colnames() %>%
+  data.frame()
+# Check
+head(color_df)
+# Rename the column 
+colnames(color_df)[1] <- "names"
+# Check
+head(color_df)
+
+metadata_w_Names_df <- rownames_to_column(metadata_df, var = "sample_names")
+metadata_dupeColNames_df <- metadata_w_Names_df %>% mutate(., "names" = sample_names)
+metadata_dupeNames_df <- column_to_rownames(metadata_dupeColNames_df, var = "sample_names")
+
+metadata_full_df <- metadata_dupeNames_df %>%
+  mutate(., "TC_percent" = ifelse(soil_type == "Lansing", 2.25, 0)) %>%
+  mutate(., "TC_percent" = ifelse(soil_type == "Florence", 0.73, TC_percent)) %>% 
+  mutate(., "TC_percent" = ifelse(soil_type == "Pendelton", 1, TC_percent))
+
+# Make a helper dataframe for plotting with colors 
+iNEXT_color_df <- 
+  color_df %>%
+  # Merge with metadata
+  left_join(metadata_dupeNames_df, by = "names") %>%
+  # Merge with colors for plotting with ggiNEXT
+  left_join(data.frame(soil_colors = soil_colors,
+            soil_type = names(soil_colors)),
+            by = "soil_type")
+
+head(iNEXT_color_df)
+```
+
+```{r plot-iNEXT-rarefaction}
+ggiNEXT(iNEXT_data, type = 1, facet.var = "Order.q") + 
+  scale_color_manual(values = iNEXT_color_df$soil_colors) + 
+  scale_fill_manual(values = iNEXT_color_df$soil_colors) + 
+  scale_shape_manual(values = base::rep(17, nsamples(archaeal_rooted_physeq))) + 
+  theme_bw() + 
+  theme(legend.position = "none") + 
+  labs(y = "Effective Number of ASVs", x = "Number of Sequences") 
+```
+
+## Manual Rarefaction Curves 
+
+```{r manual-rarefaction}
+str(iNEXT_data)
+
+iNEXT_manual_df <- 
+  iNEXT_data$iNextEst$size_based %>%
+  dplyr::rename(names = Assemblage) %>%
+  left_join(., metadata_full_df, by = "names") %>%
+  mutate(soil_type = factor(soil_type, levels = c("Lansing",
+                                              "Pendelton",
+                                              "Sand",
+                                              "Florence")))
+
+# Inspection
+dim(iNEXT_manual_df)
+
+# Manually plot rarefaction curves 
+iNEXT_manual_df %>%
+  # Filter out rows that are calculated with actual sequences (no extrapolated)
+  dplyr::filter(Method == "Rarefaction") %>%
+  # Now, let's draw the plot! 
+  ggplot(aes(x = m, y = qD, color = soil_type, group = names)) + 
+  geom_line() + 
+  # Facet by station 
+  facet_grid(Order.q~soil_type, scales = "free") + 
+  scale_color_manual(values = soil_colors) + 
+  theme_bw() + 
+  labs(y = "Effective Number of ASVs", x = "Number of Sequences") + 
+  theme(legend.position = "bottom")
+```
+
+<span style="color: red;">INTERPRETATION #1:  In all the rarefaction curves, it seems like a plateau is reached. Under the q=0,1,2 conditions, this asymptote is reached. Especially for sand, it's achieved extremely quickly. Sequencing depth appears to be adequate and analysis can proceed.</span>
+
+While the rarefaction curves from `ggiNEXT` agglomerated the data together, it was hard to see individual samples. Above, we can start to tease apart specific samples within each station, which can be done for any categorical variable. 
+
+# Statististical Testing 
+
+So, how do we actually quantify the changes in biodiversity that we may observe between the samples? That takes us into statistics! 
+
+**How to run the Shapiro-Wilk test?**
+
+
+*Run Shapiro-Wilk for Salinity*
+
+```{r shapiro-wilk-salinity}
+
+# Test of the data is normal for the continuous value of salinity
+shapiro.test(metadata_full_df$TC_percent)
+```
+
+Ok! So, the test above has a p-value <0.05, indicating that we can reject the  H₀, which will indicate that the data is **not normal**. Therefore, we need to use non-parametric statistical tests in the data. 
+
+
+*Is the simpson data normal?*
+
+```{r shapiro-wilk-simpson}
+### Now what about for richness? 
+obs_div_df <- 
+  iNEXT_manual_df %>%
+  dplyr::filter(Method == "Observed")
+
+# check it
+glimpse(obs_div_df)
+
+# Pull out unique data from the three fractions of samples 
+obs_whole_rich_df <- 
+  obs_div_df %>%
+  dplyr::filter(Order.q == 2)
+
+# Test of the data is normal for the continuous value of richness
+shapiro.test(obs_whole_rich_df$qD)
+```
+
+**YES!** The diversity data is not normal. We gotta use nonparametric methods.
+
+## Statistics in Microbial Ecology
+
+Generally speaking, we tend to use non-parametric tests in microbial ecology. It's safer to go this way. However, if there is a test performed to show that the data is normally distributed, then we can access the robustness of parametric tests! 
+
+| **Research Question**                        | **Parametric Test**       | **Non-Parametric Test**       |
+|---------------------------------------------|----------------------------|-------------------------------|
+| Compare alpha diversity (2 groups)          | t-test                     | Wilcoxon rank-sum test        |
+| Compare alpha diversity (more than 2 groups)| ANOVA                      | Kruskal-Wallis test           |
+| Correlate diversity with environmental data | Pearson correlation        | Spearman correlation          |
+| Test differences in beta diversity          | *Not applicable* (uses distance matrices) | PERMANOVA (non-parametric)  |
+| Model transformed taxon abundances          | Linear regression, GLM     | Rank-based regression         |
+
+**Takeaways about statistics**
+
+- **Parametric statistics** use data values directly (means, variances) and are more powerful when assumptions (*e.g.,* normality, homoscedasticity) are met.
+- **Non-parametric statistics** use ranks and are more powerful when there are violations of assumptions that are made in parametric statistics, making them a safer choice for skewed, sparse, or ordinal data, which is commonplace in microbial ecology. 
+- In microbial ecology, non-parametric methods are commonly used due to the nature of microbiome data (*e.g.,* zero-inflated, non-normal, compositional), but **parametric tests are absolutely valid** when assumptions are met or appropriate transformations are applied.
+
+Choose your statistical approach based on the:
+
+- Type and distribution of your data
+- Question you're asking
+- Assumptions your data can reasonably meet
+
+
+# Categorical Analysis: 2 or more groups 
+
+Carbon content is pulled from a chart in supplementary materials with the average total carbon in each soil type. It doesn't differentiate b/w each sample so carbon content and soil type are 1:1 correlated in my metadata.
+
+### Diversity by Station
+
+```{r make-obs-df}
+# Plot boxplots by soil against diversity
+obs_div_df %>%
+  ggplot(aes(x = soil_type, y = qD, fill = soil_type, 
+             color = soil_type)) + 
+  facet_wrap(.~Order.q, scales = "free_y") + 
+  geom_jitter() + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  labs(y = "Effective Number of ASVs") + 
+  theme_bw() + 
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 30,
+                                   hjust = 1, 
+                                   vjust = 1))
+```
+
+
+#### Statistically test Richness
+
+
+```{r station-diversity-richness, fig.height=4, fig.width=4}
+# Pull out richness data 
+obs_rich_df <- 
+  obs_div_df %>%
+  dplyr::filter(Order.q == 0)
+
+# Calculate the kruskal wallis 
+krusk_station_rich <- 
+  kruskal_test(qD ~ soil_type, data = obs_rich_df)
+
+# Look at it 
+krusk_station_rich
+summary(krusk_station_rich)
+
+# Richness by station 
+rich_ggboxplot <- 
+  ggboxplot(obs_rich_df, x = "soil_type", y = "qD", 
+          color = "soil_type", fill = "soil_type", alpha = 0.3,
+          outlier.shape = NA) + 
+  # Add points
+  geom_jitter(aes(color = soil_type)) + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  labs(y = "# of Total ASVs (Richness)") + 
+  stat_compare_means(method = "kruskal.test", label.y = min(obs_rich_df$qD)) + 
+  geom_pwc(
+    aes(group = soil_type), tip.length = 0, hide.ns = TRUE,
+    method = "wilcox.test", label = "p.adj.format",
+    p.adjust.method = "fdr", bracket.nudge.y = -0.08) + 
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 30,
+                                   hjust = 1, 
+                                   vjust = 1))
+
+rich_ggboxplot
+```
+
+### Shannon
+
+```{r station-diversity-shannon, fig.height=4, fig.width=4}
+# Pull out shannon data 
+obs_shan_df <- 
+  obs_div_df %>%
+  dplyr::filter(Order.q == 1)
+
+# Calculate the kruskal wallis 
+krusk_station_shan <- 
+  kruskal_test(qD ~ soil_type, data = obs_shan_df)
+
+# Look at it 
+krusk_station_shan
+summary(krusk_station_shan)
+
+# Richness by station 
+shan_ggboxplot <- 
+  ggboxplot(obs_shan_df, x = "soil_type", y = "qD", 
+          color = "soil_type", fill = "soil_type", alpha = 0.3,
+          outlier.shape = NA) + 
+  # Add points
+  geom_jitter(aes(color = soil_type)) + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  labs(y = "# of Total ASVs (Shannon)") + 
+  stat_compare_means(method = "kruskal.test", label.y = min(obs_shan_df$qD)) + 
+  geom_pwc(
+    aes(group = soil_type), tip.length = 0, hide.ns = TRUE,
+    method = "wilcox.test", label = "p.adj.format",
+    p.adjust.method = "fdr", bracket.nudge.y = -0.08) + 
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 30,
+                                   hjust = 1, 
+                                   vjust = 1))
+
+shan_ggboxplot
+```
+
+### Simpson
+
+```{r station-diversity-simpson, fig.height=4, fig.width=4}
+# Pull out simpson data 
+obs_simps_df <- 
+  obs_div_df %>%
+  dplyr::filter(Order.q == 2)
+# Calculate the kruskal wallis 
+krusk_station_simp <- 
+  kruskal_test(qD ~ soil_type, data = obs_simps_df)
+
+# Look at it 
+krusk_station_simp
+summary(krusk_station_simp)
+
+# Richness by station 
+simp_ggboxplot <- 
+  ggboxplot(obs_simps_df, x = "soil_type", y = "qD", 
+          color = "soil_type", fill = "soil_type", alpha = 0.3,
+          outlier.shape = NA) + 
+  # Add points
+  geom_jitter(aes(color = soil_type)) + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  labs(y = "# of Total ASVs (Simpson)") + 
+  stat_compare_means(method = "kruskal.test", label.y = min(obs_simps_df$qD)) + 
+  geom_pwc(
+    aes(group = soil_type), tip.length = 0, hide.ns = TRUE,
+    method = "wilcox.test", label = "p.adj.format",
+    p.adjust.method = "fdr", bracket.nudge.y = -0.08) + 
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 30,
+                                   hjust = 1, 
+                                   vjust = 1))
+
+simp_ggboxplot
+```
+
+
+```{r plot-rich-simps, fig.width=8, fig.height=4}
+# Show the plots
+rich_ggboxplot + shan_ggboxplot + simp_ggboxplot
+```
+
+<span style="color: red;">INTERPRETATION #2:  It's quite interesting. Lansing has the highest total carbon content, followed by Pendelton, and then Florence. Sand had no carbon content. This trend is reflected in the ASV counts when q = 0 and q = 2, but surprisingly, when q = 1, Pendelton, which has the intermediate amount of carbon, has the highest ASVs.  There could be other nutrient/soil compositional factors which are responsible for this effect. There doesn't however seem to be a statistically significant effect of soil type on ASVs. </span>
+
+<span style="color: red;">INTERPRETATION #3:  Kruskal Wallis Test, since the data was not parametric, with wilcoxon for pairwise comparisons.</span>
+
+
+# Continuous Relationships - Salinity (PSU) vs Biodiversity
+
+
+## Spearman vs. Linear Model: What’s the Difference?
+
+| Feature                  | **Spearman Correlation**                           | **Linear Model (`lm()`)**                               |
+|--------------------------|----------------------------------------------------|----------------------------------------------------------|
+| **Type of Relationship** | Monotonic (increasing or decreasing)              | Linear (straight-line relationship)                      |
+| **Assumptions**          | Non-parametric (no distribution assumptions)      | Parametric (normality, linearity, homoscedasticity)      |
+| **Input Data**           | Ordinal, ranked, or continuous                    | Continuous (can include categorical predictors too)      |
+| **What it Measures**     | Strength and direction of monotonic relationship  | Effect size, direction, significance of predictors        |
+| **Output**               | Correlation coefficient (ρ) and p-value           | Intercept, slope(s), p-values, R², residuals, etc.       |
+| **Resistant to Outliers?** | More robust                                     | Sensitive to outliers                                    |
+| **Function in R**        | `cor.test(x, y, method = "spearman")`             | `lm(y ~ x)`                                              |
+
+
+## Environmental Variables 
+
+```{r environ-check}
+# Create dataframe of environmental variables 
+env_df <- 
+  metadata_full_df %>%
+  dplyr::select(names, TC_percent)
+```
+
+
+## Continuous Variable—Practical Salinity Units: PSU 
+
+A **Practical Salinity Unit** is equal to:  
+
+- 1 PSU = 1 g salt per 1,000 g water = 1 ppt
+
+PSU ranges between 0 and >30, where: 
+
+- Freshwater: 0-0.5
+- Brackish: 0.5 - 30
+- Marine: >30
+
+```{r plot-div-salinity-lm, fig.width=7, fig.height=3.5}
+# How does biodiversity change over the salinity gradient?
+obs_div_df %>%
+  ggplot(aes(x = TC_percent, y = qD)) + 
+  facet_wrap(.~Order.q, scales = "free") + 
+  geom_point(aes(color = soil_type)) + 
+  scale_color_manual(values = soil_colors) + 
+  labs(x = "Total Carbon (percent)", y = "Effective Number of ASVs") +
+  stat_smooth(method = "lm", formula = y ~poly(x, 2)) + 
+  theme_bw() + 
+  theme(legend.position = "bottom",
+        legend.title = element_blank())
+```
+
+
+```{r plot-richness-sal, fig.height=4, fig.width=4, warning = FALSE}
+simp_df <- 
+  obs_div_df %>%
+  dplyr::filter(Method == "Observed") %>%
+  dplyr::filter(Order.q == 2)
+
+
+simp_vs_c_lm <- 
+  lm(qD ~ TC_percent, data = simp_df)
+
+simp_df %>% 
+  ggplot(aes(x = TC_percent, y = qD)) + 
+  geom_point(aes(color = soil_type)) + 
+  stat_smooth(method = "lm") + 
+  labs(x = "Total Carbon (percent)", y = "# of ASVs") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_x_continuous(limits = c(-0.5, 3))+
+  theme_bw() + 
+  theme(legend.position = "bottom",
+        legend.title = element_blank()) + 
+  geom_label(hjust = 0, 
+             label = paste("Adj R2 = ",signif(summary(simp_vs_c_lm)$adj.r.squared, 2),
+                           "\nIntercept =",signif(simp_vs_c_lm$coef[[1]],3),
+                           " \nSlope =",signif(simp_vs_c_lm$coef[[2]], 2),
+                           " \nP =",signif(summary(simp_vs_c_lm)$coef[2,4], 2)))
+```
+
+
+## Spearman Correlation
+
+
+```{r rich-vs-salinity-spearman, fig.width=4, fig.height=4}
+simp_df %>% 
+  ggplot(aes(x = TC_percent, y = qD)) + 
+  geom_point(aes(color = soil_type)) + 
+  stat_smooth(method = "lm") + 
+  labs(x = "Total Carbon (percent)", y = "# of ASVs") + 
+  scale_color_manual(values = soil_colors) + 
+  theme_bw() + 
+  theme(legend.position = "bottom",
+        legend.title = element_blank()) + 
+  stat_cor(method = "spearman", label.x = 1.25, label.y = 30)  # customize label position
+```
+
+<span style="color: red;">INTERPRETATION #4:  When q=0, there is an n shaped curve, so while higher carbon content had higher ASVs than intermediate carbon, it was not as big of an increase from no carbon content to intermediate carbon content. This curve linearized as we moved to q=1 and q=2. This perhaps indicates that dominant species play a large role in high carbon content soils rather than rare species.</span>
+
+<span style="color: red;">INTERPRETATION #5:  Spearman correlation test since that is non parametric (data is not normal)</span>
+
+
+## Session Information
+
+```{r session-info}
+# Ensure reproducibility with package version information
+devtools::session_info()
+```
