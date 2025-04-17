@@ -1,0 +1,577 @@
+---
+title: "Between-Sample (Beta) Diversity of Microbes along a Salinity Gradient"
+author: "Antone Jung"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document: 
+    code_folding: show
+    theme: spacelab
+    highlight: pygments
+    keep_md: no
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+      toc_depth: 3
+  keep_md: true  
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      fig.path = "../figures/06_Ordination/")
+```
+
+# Goals 
+
+1. Load in phyloseq data with rooted tree & colors and functions.  
+2. Evaluate sequencing depth and remove samples, if needed.  
+3. Normalize the read counts between samples.  
+4. Calculate community **dis**similarities. Numbers between 0 and 1. If 0, completely similar versus if they are 1, then they're completely dissimilar.   
+    a. **Sorensen**: Shared Species as a binary value: Abundance-unweighted 
+    b. **Bray-Curtis**: Shared Abundant species: Abundance-weighted
+    c. **(Abundance-)Weighted UNIFRAC**: Consider Abundant Species and where they fall on the tree  
+5. Run statistics with functions from the vegan R package: 
+    a. PERMANOVA with `adonis2()`.
+    b. betadispR with `betadisper()` and `permutest()`. 
+6. Visualize the community data with two unconstrained Ordinations:  
+    a. **PCoA**: Linear Method. Eigenvalue = how much variation is explained by each axis. Choose to view axis 1, 2, 3, etc. and plot them together.  
+    b. **NMDS**: Non-linear. Smush multiple Dimensions into 2 or 3 axes. Need to report Stress value (ideally <0.15).  
+
+## Inputs 
+
+1. We will need the `phytree_preprocessed_physeq.RData`, which includes a rooted tree (ideally within the archaea!) that we created in `analysis/04B_Phylogenetic_Tree_Inspection.Rmd`. 
+
+## Outputs 
+
+*This is an exciting analysis!!! We get to answer another one of our scientific questions!*
+
+1. Calculated beta-diversity dissimilarity measures (*e.g.* Sorensen, Bray-Curtis, abundance-unweighted and -weighted UniFrac) across every sample. 
+2. Ordination figures (*i.e.,* PCoA/NMDS) to include in the scientific paper that visualize the data as it relates to the scientific question.
+3. Statistical tests (*i.e.,* PERMANOVA & betadisper) conveying the measured and quantified changes and patterns in biodiversity.
+
+# Scientific Question 
+
+How does microbial composition change across a salinity gradient?
+
+- *Null Hypothesis:* Microbial composition (*e.g.* Sorensen, Bray-Curtis, abundance-unweighted and -weighted UniFrac) does not change across an organic carbon gradient. 
+- *Alternative #1 Hypothesis:* Dominant phylogenetic groups (*e.g.* abundance-weighted UNIFRAC) will be dissimilar as organic carbon concentration changes.
+
+<span style="color: red;">INTERPRETATION #1:  My scientific question is how does soil composition change with organic carbon content. My hypothesis is that organic carbon concentration will lead to changes in dominant phylogenetic groups (weighted unifrac), as it selects for certain metabolic characteristics of different clades. </span>
+
+# Set up
+
+## Set the seed
+
+```{r set-seed}
+set.seed(10202005)
+```
+
+## Load Packages, colors & functions  
+```{r load-packages}
+pacman::p_load(tidyverse, devtools, phyloseq, patchwork, vegan, 
+               install = FALSE)
+
+# Load Colors 
+source("code/colors.R")
+
+# Load functions 
+source("code/functions.R")
+```
+
+# 1. Load in the data 
+
+```{r load-data}
+# load phyloseq object
+load("data/04_PhylogeneticTree/archaeal_rooted_physeq.RData")
+archaeal_rooted_physeq
+
+# Intuition check on seq depth
+min(sample_sums(archaeal_rooted_physeq))
+```
+# Normalizing the Read Depth 
+
+## 2. Explore the Raw Read Counts 
+
+```{r explore-read-counts, fig.width=6, fig.height=3}
+# calculate read counts per sample 
+raw_TotalSeqs_df <- 
+  archaeal_rooted_physeq %>%
+  # Calculate the total number of sequences/reads
+  sample_sums() %>%
+  data.frame()
+
+# Take a look 
+head(raw_TotalSeqs_df)
+
+# Rename the column 
+colnames(raw_TotalSeqs_df)[1] <- "TotalSeqs"
+
+# add a new column of num_ASVs (RAW, non-noramlized # ASVs)
+raw_TotalSeqsASVs_df <- 
+  raw_TotalSeqs_df %>%
+  mutate(num_ASVs = colSums(otu_table(archaeal_rooted_physeq) > 1))
+
+#View(raw_TotalSeqsASVs_df)
+
+# Plot histogram of seq depth 
+rawSeq_histogram <- 
+  raw_TotalSeqsASVs_df %>%
+  ggplot(aes(x = TotalSeqs)) + 
+  geom_histogram(bins = 50) + 
+  scale_x_continuous(limits = c(0, 50000)) + 
+  labs(title = "Raw Seq Depth Histogram") + 
+  theme_bw()
+
+# Plot Seq Depth versus num_ASVs
+rawSeq_vs_numASV_plot <- 
+  raw_TotalSeqsASVs_df %>%
+  ggplot(aes(x = num_ASVs, y = TotalSeqs)) + 
+  geom_point() + 
+  scale_y_continuous(limits = c(0, 50000)) +
+  geom_smooth(method = "lm") + 
+  labs(title = "Seq Depth vs # ASVs") + 
+  theme_bw()
+
+# is it significant? 
+summary(lm(TotalSeqs ~ num_ASVs, data = raw_TotalSeqsASVs_df))
+
+# Put the two plots together.
+rawSeq_histogram + rawSeq_vs_numASV_plot +
+  plot_annotation(tag_levels = "A")
+```
+
+<span style="color: red;">INTERPRETATION #2:  I scaled the read depth to 9539 sequences (the minimum sequencing depth). At that point, by and large most rarefaction curves are asymptotic, so it is sufficient to perform beta-diversity analysis. </span>
+
+# 3. Scale Read Counts 
+
+```{r scale-reads, fig.width=6, fig.height=3}
+min(sample_sums(archaeal_rooted_physeq))
+
+# Scale the reads 
+scaled_physeq <- 
+  archaeal_rooted_physeq %>%
+  scale_reads(round = "exactround")
+
+# Look at it 
+scaled_physeq
+
+# Look at it more!
+#View(data.frame(otu_table(archaeal_rooted_physeq)))
+#View(data.frame(otu_table(scaled_physeq)))
+
+# Confirm seq read depth of scaled_physeq 
+scaled_TotalSeqs_df <- 
+  scaled_physeq %>%
+  sample_sums() %>%
+  data.frame()
+
+colnames(scaled_TotalSeqs_df)[1] <- "TotalSeqs"
+
+# add a new column of num_ASVs (RAW, non-noramlized # ASVs)
+scaled_TotalSeqsASVs_df <- 
+  scaled_TotalSeqs_df %>%
+  mutate(num_ASVs = colSums(otu_table(scaled_physeq) > 1))
+
+# Plot it! 
+scaledSeq_histogram <- 
+  scaled_TotalSeqs_df %>%
+  ggplot(aes(x = TotalSeqs)) + 
+  geom_histogram(bins = 50) + 
+  labs(title = "Scaled Seq Depth Histogram") + 
+  scale_x_continuous(limits = c(0, 50000)) + 
+  theme_bw()
+
+# Scaling always gives us a range! 
+# MInimum sequences
+min(scaled_TotalSeqs_df$TotalSeqs) 
+# Total Range 
+range(scaled_TotalSeqs_df)
+# How many is that range? 
+range_seqs <- (max(scaled_TotalSeqs_df$TotalSeqs) - min(scaled_TotalSeqs_df$TotalSeqs))
+range_seqs
+# And in terms of percent? 
+range_seqs/max(scaled_TotalSeqs_df$TotalSeqs)
+#View(scaled_TotalSeqs_df)
+
+# Set the axis min and max for the next plot 
+max_y <- max(scaled_TotalSeqs_df$TotalSeqs) + 10
+min_y <- min(scaled_TotalSeqs_df$TotalSeqs) - 10
+
+# Now, draw the plot 
+scaledSeq_vs_numASV_plot <- 
+  scaled_TotalSeqsASVs_df %>%
+  ggplot(aes(x = num_ASVs, y = TotalSeqs)) + 
+  geom_point() + 
+  scale_y_continuous(limits = c(min_y, max_y)) +
+  #geom_smooth(method = "lm") + 
+  theme_bw() + 
+  labs(title = "Scaled: Seq Depth vs # ASVs")
+
+# Put the two plots together.
+scaledSeq_histogram + scaledSeq_vs_numASV_plot +
+  plot_annotation(tag_levels = "A")
+```
+
+<span style="color: red;">INTERPRETATION #3:  I scaled the read depth to 9539 sequences (the minimum sequencing depth). Using the exactcount rounding function, all my samples had 9539 as the final sequencing depth. </span>
+
+# 3. Calculating dissimilarity
+
+Now, let's make distance objects of each of the dissimiliarity measures above! 
+
+```{r calc-dissimilarity}
+# Sorensen Dissimiliarty
+scaled_sorensen_dist <- phyloseq::distance(scaled_physeq, method = "bray", binary = TRUE)
+
+# What does it look like? 
+class(scaled_sorensen_dist)
+str(scaled_sorensen_dist)
+#head(as.matrix(scaled_sorensen_dist))
+
+# Bray-Curtis Dissimiliarty
+scaled_bray_dist <- phyloseq::distance(scaled_physeq, method = "bray", binary = FALSE)
+
+# Abundance-Unweighted UniFrac
+scaled_uUnifrac_dist <- phyloseq::distance(scaled_physeq, method = "unifrac")
+
+# Abundance-Weighted UniFrac
+scaled_wUnifrac_dist <- phyloseq::distance(scaled_physeq, method = "wunifrac")
+```
+
+<span style="color: red;">INTERPRETATION #4:  Weighted Unifrac is most appropriate since we're interested to see if the dominant species in each sample are evolutionarily distinct. </span>
+
+
+# 5a. PERMANOVA: Testing Means/Centroids
+
+The goal of PERMANOVA is to ask: *Do the centroids (i.e., means) differ between groups?*  
+
+## Key Parameters in `adonis2()`
+
+- `strata`: Use strata to restrict permutations within groups, which is critical for paired or repeated measures designs. This would be a column in the `metadata_df`.
+    - example: `strata = metadata_df$Sample_Names`
+- `by`: Specifies how model terms are tested. It can be: 
+    - `by = "terms"`: (default) tests each term sequentially. Therefore, it is sensitive to the order in which we put the varaibles into the model. 
+    - `by = "margin"`: tests each term while adjusting for others (like Type III sum of squares). Using `margin` ensures that each term is tested independently of the others—especially important when interactions are included or the design is unbalanced.
+    - `by = "none"`: tests only the full model.
+- `parallel`: Runs permutations using multiple CPU cores. This is helpful for large datasets or when using a large number of permutations.
+
+### Summary Table of Useful `adonis2()` Parameters
+
+| Parameter      | Purpose                                           | When to Use                                                   |
+|----------------|---------------------------------------------------|----------------------------------------------------------------|
+| `permutations` | Number of permutations for p-value calculation   | Always (use 9999+ for more stable results)                     |
+| `strata`       | Restrict permutations within groups               | For paired samples, repeated measures, or blocks               |
+| `by`           | Controls how model terms are tested              | Use `"margin"` to test each variable while adjusting for others |
+| `method`       | Calculate distance matrix internally              | Only if supplying a raw OTU/ASV table                          |
+| `sqrt.dist`    | Apply square-root transformation to distances     | Rarely needed; used in specific workflows                      |
+| `parallel`     | Run permutations using multiple CPU cores         | Speeds up large analyses with many permutations                |
+
+## Categorical & Continuous Variables in PERMANOVA
+
+`adonis2()` can also be run on continuous variables — and it’s actually a powerful way to test whether variation in microbial community composition is associated with continuous environmental or biological gradients (*e.g.,* pH, temperature, nutrient concentration, latitude, host age, etc.). In `adonis2()`, continuous variables are treated as predictors in a linear model-like framework. The test evaluates whether changes in the continuous variable are significantly associated with shifts in microbial community composition (as measured by your distance matrix).
+
+For now, we will focus on comparing the Sorensen and the Bray-Curtis. More on UniFrac soon! 
+
+### WUNIFRAC
+
+```{r PERMANOVA-categorical-wunifrac}
+# Sorensen
+## 1. Run with by = terms for R² values, sensitive to order of variables! 
+## ALWAYS check and confirm the order of your terms and how they interact with each other.
+
+metadata_df <- read_csv("data/metadata_full.csv")
+wunifrac_soil_adonis_terms1 <- adonis2(scaled_wUnifrac_dist ~ soil_type, data = metadata_df, by = "terms")
+wunifrac_soil_adonis_terms1
+
+sorensen_soil_adonis_terms1 <- adonis2(scaled_sorensen_dist ~ soil_type, data = metadata_df, by = "terms")
+sorensen_soil_adonis_terms1
+
+bray_soil_adonis_terms1 <- adonis2(scaled_bray_dist ~ soil_type, data = metadata_df, by = "terms")
+bray_soil_adonis_terms1
+
+unifrac_soil_adonis_terms1 <- adonis2(scaled_uUnifrac_dist ~ soil_type, data = metadata_df, by = "terms")
+unifrac_soil_adonis_terms1
+```
+
+
+### Understanding PERMANOVA output: 
+
+- **Pr(>F) Interpretation:** The p-value. Is it "*significant*"?  
+    - This represents the "*probability of observing an F-statistic this extreme (or more extreme), assuming the null hypothesis is true.*" In essence, this is the **p-value** from the permutation test. This value tells us whether the variance explained by a variable (or interaction) is significantly greater than expected by chance.
+- **R^2^ value Interpretation:** How much variation is explained by this variable—an effect size.
+    - Not dependent on sample size. 
+    - Interpretable across studies! 
+    - R^2^ (also called “pseudo R^2^” in PERMANOVA) is the proportion of total variation in the multivariate data that is explained by a specific variable or interaction.
+        - R^2^ = 0.25 means that the term explains 25% of the variation in the community composition.
+        - R^2^ = 0.03 means that the term explains only 3% of variation — possibly statistically significant but a small effect. This is important because 3% is not much variation! So, therefore, even it if is *significant* based on the p-value, it explains an *insignificant* amount of variation. 
+- **F-statistic Interpretation:** How strongly a variable separates groups, relative to residuals. 
+    - Higher F-values tell us that there is stronger separation of groups. he F-statistic is a ratio of explained to unexplained variation, adjusted for degrees of freedom — similar to traditional ANOVA, but applied to a distance matrix (like Bray-Curtis, Jaccard, *etc.*). It tells you how much more variation is explained by the model (with your term included) compared to the residual (unexplained) variation.
+
+### Interpreting PERMANOVA
+
+<span style="color: red;">INTERPRETATION #5: Interestingly, the order of R2 value/F statistic from lowest to highest was wunifrac, bray, unifrac, then wunifrac. Rather than dominant species, it seems like soil_type has the greatest importance on rare species. All dissimilarity measures have significant p-values </span>
+
+
+# 5b. Betadisper: Testing Variances/Dispersions
+
+First, `betadisper()` will perform the following steps: 
+
+1.	Input: A distance matrix (e.g., from vegdist() or phyloseq::distance()) and a grouping factor (e.g., station).
+2.	Calculate the centroid of each group in multivariate space (via PCoA).
+3.	Compute the distance from each sample to its group’s centroid.
+4.	Store those distances — these are the within-group dispersions.
+
+Second, `permutest()` will perform the following steps: 
+
+1.	Null hypothesis (H~0~): All groups have equal multivariate dispersion.
+2.	Observed F-statistic is calculated from the variation among group dispersions.
+3.	Permutations: Group labels are shuffled many times (*e.g.,* 999 times).
+4.	For each permutation, a new F-statistic is calculated.
+5.	The p-value is the proportion of permutations where the F is as extreme or more extreme than the observed F.
+
+The result from `permutest()` is a robust non-parametric p-value testing whether dispersion differs across groups.
+
+**Always run `betadisper()` and `permutest()` after PERMANOVA** to test whether the groups have similar within-group variation.
+
+- If p > 0.05 (not significant), the PERMANOVA result is reliable.
+- If p < 0.05 (significant), be cautious—group differences may be due to dispersion, not composition! However, not all is lost as we may expect this to be biologically true.  
+
+**In Summary:**
+
+| Function       | What it does                                                  | Significance test? | Output includes                    |
+|----------------|---------------------------------------------------------------|---------------------|------------------------------------|
+| `betadisper()` | Computes within-group distances to centroids (dispersion)     | ❌ No                | Distances, centroids, model object |
+| `permutest()`  | Tests if group dispersions differ using permutations          | ✅ Yes               | F-value, permutation-based p-value |
+
+## Sorensen
+
+```{r betadisper-sorensen}
+# Homogeneity of Disperson test with beta dispr
+# Sorensen Betadisper - Soil
+dispr_sorensen_station <- betadisper(scaled_sorensen_dist, metadata_df$soil_type)
+# permutest() performs a non-parametric permutation test, which is robust and valid for the kind of data used in beta diversity analysis (e.g., dissimilarity matrices).
+permutest(dispr_sorensen_station)
+
+dispr_bray_station <- betadisper(scaled_bray_dist, metadata_df$soil_type)
+permutest(dispr_bray_station)
+
+dispr_unifrac_station <- betadisper(scaled_uUnifrac_dist, metadata_df$soil_type)
+permutest(dispr_unifrac_station)
+
+dispr_wunifrac_station <- betadisper(scaled_wUnifrac_dist, metadata_df$soil_type)
+permutest(dispr_wunifrac_station)
+```
+
+**Next steps:**
+
+- Use ordination plots to visually assess whether centroids are distinct or just differently dispersed (*We are about to do this!*)
+- Plot distances to group centroids
+- Consider running PERMANOVA on a subset with equal dispersions
+- Reflect on ecological plausibility — are the dispersion differences biologically meaningful? Sometimes real biological processes cause both composition shifts and dispersion changes (e.g., disturbance, environmental heterogeneity)! So, don't lose your heart about your data yet! :) 
+
+> Even with unequal dispersion, true ecological differences can still exist — the key is to **interpret with care** and use supporting evidence.
+
+If this happens, the results could be written something like: "*PERMANOVA indicated significant differences in microbial community composition across treatments (p < 0.001), though betadisper was also significant (p = 0.03), suggesting differences in within-group dispersion. Ordination plots showed distinct clustering of treatment centroids, supporting genuine compositional differences, though interpretations must consider potential heterogeneity in dispersion.*"
+
+
+<span style="color: red;">INTERPRETATION #6: Although unweighted unifrac and sorensen have the higher R2 and F values, they also have significant differences in dispersion. Weighted unifrac and bray curtis, however, do not have significantly different dispersions among groups. Therefore, we can more cleanly interpret the centroid of these dissimilarity measures as significantly different.</span>
+
+<span style="color: red;">INTERPRETATION #7: Taking into account both the betadisper()/permutest() and the PERMANOVA (adonis2()) test that you ran, we can conclude that dominant species (both when taking into account phylogeny or not) have significantly different centroids, while richness measures may have different centroids, but ordination plots are needed to verify. </span>
+
+
+# 6. Visualize Community Dissimilarity with Ordination
+
+##  Key Types of Ordination Methods
+
+In practice, the most common ordination methods in microbial ecology are: 
+
+1. **PCoA** - Eigen-based analysis, linear, axis coefficients are meaningful because they represent the eigenvectors. 
+2. **NMDS** - Non-linear method, axes are not meaningful, smush many axes of data into 2 axes
+
+# 6a. PCoA: Principal Coordinates Analysis
+
+
+```{r pcoa-plots, fig.height=3.5, fig.width=7}
+### SORENSEN 
+# First, calculate PCoA with Sorensen
+scaled_soren_pcoa <- 
+  ordinate(physeq = scaled_physeq,
+         method = "PCoA",
+         distance = "bray", binary = TRUE)
+
+# Take a quick look
+str(scaled_soren_pcoa)
+
+# Plot it: Sorensen PCoA  
+sorensen_pcoa_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_soren_pcoa,
+                color = "soil_type",
+                title = "Sorensen PCoA") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# bray
+scaled_bray_pcoa <- 
+  ordinate(physeq = scaled_physeq,
+         method = "PCoA",
+         distance = "bray")
+
+bray_pcoa_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_bray_pcoa,
+                color = "soil_type",
+                title = "Bray PCoA") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# unifrac
+scaled_unifrac_pcoa <- 
+  ordinate(physeq = scaled_physeq,
+         method = "PCoA",
+         distance = "unifrac")
+
+unifrac_pcoa_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_unifrac_pcoa,
+                color = "soil_type",
+                title = "Unifrac PCoA") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# wunifrac
+scaled_wunifrac_pcoa <- 
+  ordinate(physeq = scaled_physeq,
+         method = "PCoA",
+         distance = "wunifrac")
+
+wunifrac_pcoa_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_wunifrac_pcoa,
+                color = "soil_type",
+                title = "wUnifrac PCoA") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# Show the plots 
+sorensen_pcoa_plot + bray_pcoa_plot + unifrac_pcoa_plot + wunifrac_pcoa_plot
+```
+
+<span style="color: red;">INTERPRETATION #8: Strangely, while the betadispr()/permutest() reported significantly different dispersions for Sorensen and unweighted unifrac, they seem to be actually more distinct and organized as clusters than weighted unifrac and Bray-Curtis. I think it is reasonable to say that the centroids are different for richness measures. </span>
+
+## 6b. NMDS: Non-Metric Multidimensional Scaling 
+
+*Okay, let's draw some NMDS plots!*
+
+```{r soren-nmds}
+### SORENSEN 
+# First, calculate PCoA with Sorensen
+scaled_soren_nmds <- 
+  ordinate(physeq = scaled_physeq,
+         method = "NMDS",
+         distance = "bray", binary = TRUE)
+
+# Take a quick look
+str(scaled_soren_nmds)
+
+# Plot it: Sorensen PCoA  
+sorensen_nmds_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_soren_nmds,
+                color = "soil_type",
+                title = "Sorensen NMDS") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# bray
+scaled_bray_nmds <- 
+  ordinate(physeq = scaled_physeq,
+         method = "NMDS",
+         distance = "bray")
+
+bray_nmds_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_bray_nmds,
+                color = "soil_type",
+                title = "Bray NMDS") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# unifrac
+scaled_unifrac_nmds <- 
+  ordinate(physeq = scaled_physeq,
+         method = "NMDS",
+         distance = "unifrac")
+
+unifrac_nmds_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_unifrac_nmds,
+                color = "soil_type",
+                title = "Unifrac NMDS") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# wunifrac
+scaled_wunifrac_nmds <- 
+  ordinate(physeq = scaled_physeq,
+         method = "NMDS",
+         distance = "wunifrac")
+
+wunifrac_nmds_plot <- 
+  plot_ordination(physeq = scaled_physeq,
+                ordination = scaled_wunifrac_nmds,
+                color = "soil_type",
+                title = "wUnifrac NMDS") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_shape_manual(values = c(15, 16, 17)) + 
+  geom_point(size = 5, alpha = 0.5, aes(color = soil_type)) + 
+  theme_bw() + 
+  theme(legend.position = "right")
+
+# Show the plots 
+sorensen_nmds_plot + bray_nmds_plot + unifrac_nmds_plot + wunifrac_nmds_plot
+```
+
+
+<span style="color: red;">INTERPRETATION #9: Rather than clusters, some of the data in an NMDS form a line (e.g. pendelton, lansing, florence in unifrac, sorensen, and bray). Sand seems to be pretty clustered. Between sorensen and bray, there doesn't seem to be much of a difference, whereas there is a significant difference in the uniformity and cluster distinctiveness between unifrac and wunifrac.</span>
+
+
+## All ordinations together!
+
+```{r ordinations, fig.width=7, fig.height=6}
+sorensen_pcoa_plot + bray_pcoa_plot + unifrac_pcoa_plot + wunifrac_pcoa_plot + sorensen_nmds_plot + bray_nmds_plot + unifrac_nmds_plot + wunifrac_nmds_plot
+```
+
+<span style="color: red;">INTERPRETATION #10: I think PCoA better shows the separation of centroids for sorensen and unifrac. Since these were the methods with significant dispersions, the purpose of the plots are mainly to show that it is not only the dispersions that are significant but also the location effect. This is more pronounced in the PCoA in my opinion. </span>
+
+# Final info for Reproducibility 
+
+## Session Information
+
+```{r session-info}
+# Ensure reproducibility with package version information
+devtools::session_info()
+```

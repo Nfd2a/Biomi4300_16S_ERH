@@ -155,6 +155,8 @@ metadata_full_df <- metadata_dupeNames_df %>%
   mutate(., "TC_percent" = ifelse(soil_type == "Florence", 0.73, TC_percent)) %>% 
   mutate(., "TC_percent" = ifelse(soil_type == "Pendelton", 1, TC_percent))
 
+write.csv(metadata_full_df, "data/metadata_full.csv")
+
 # Make a helper dataframe for plotting with colors 
 iNEXT_color_df <- 
   color_df %>%
