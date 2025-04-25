@@ -15,7 +15,7 @@ scale_reads <- function(physeq, n = min(sample_sums(physeq)), round = "round") {
     otu_table(physeq.scale) <- matround(otu_table(physeq.scale))
   } else if (round == "exactround"){
     # exactround calculates the rounding threshold for each sample so that 
-    # all sample sums normalize exactly to the previous minimum sample sum
+    # all sample sums normalize exactly to the minimum sample sum
     transposed_otu <- t(otu_table(physeq.scale))
     for(sample in 1:nrow(transposed_otu)){
       sample_vec <- transposed_otu[sample,]

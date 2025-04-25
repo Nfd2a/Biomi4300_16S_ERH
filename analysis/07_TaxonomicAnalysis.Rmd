@@ -1,0 +1,491 @@
+---
+title: "Microbial Compositional Analysis Across Different Soils"
+author: "Antone Jung"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document: 
+    code_folding: show
+    theme: spacelab
+    highlight: pygments
+    keep_md: no
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+      toc_depth: 3
+  keep_md: true  
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE,
+                      fig.path = "../figures/07_Composition/")
+```
+
+# Goals
+
+In this file, we will perform compositional analysis of our scaled/noramlized/rarefied microbial dataset! 
+
+1. Load in scaled/normalized phyloseq object. 
+2. Calculate the relative abundances of taxonomic groups at various levels: 
+    A. Phylum
+    B. Genus
+    C. ASV 
+3. Plot them, and narrow in on specific taxnomic group of interest
+
+## Inputs 
+
+1. We will need the `scaled_physeq.RData`, which includes a rooted tree that we created in `analysis/06_Ordination/scaled_physeq.RData`. 
+
+## Outputs 
+
+1. Beautiful visualizations of microbial taxa and how they vary across parameters related to our study: station (categorical) and salinity (continuous).
+2. Run some stats! 
+
+# Compositional Data 
+
+Microbial abundance data—like 16S rRNA gene or metagenomics data—are typically **compositional:** they represent relative abundances constrained to a constant total (*e.g.,* percent or proportions). This introduces spurious correlations and other issues if analyzed with traditional statistics. This is a very important limitation to microbial data! 
+
+
+<span style="color: red;">INTERPRETATION #1: When a relative abundance increases, its ambiguous if the population grew or the surrounding community shrunk. Especially when looking at environmental variables, the distinction between something being beneficial and something being less harmful to a species is significant.  </span>
+
+# Setup 
+
+## Load Packages 
+```{r load-packages}
+# Load in the packages 
+pacman::p_load(tidyverse, devtools, DT, phyloseq, patchwork, 
+               install = FALSE)
+
+# load colors
+source("code/colors.R")
+```
+
+
+## 1. Load in Scaled Phyloseq object 
+
+The following phyloseq object contains microbial community composition data in a standardized format. In this case, we’ve already normalized the reads (scaled to 1,942 per sample), which is essential for comparing relative abundances.
+
+
+```{r load-data}
+load("data/06_Ordination/scaled_physeq.RData")
+
+# Look at the data 
+scaled_physeq
+
+min(sample_sums(scaled_physeq))
+range(sample_sums(scaled_physeq))
+```
+
+# Taxonomic Analysis! 
+
+In this analysis, we will drill down from phylum to ASV level analyses, which will enable increasingly detailed insights into microbial diversity and potential ecological roles. However, it is also important for us to remember that deeper levels also come with increased noise and data sparsity, especially for rare groups.
+
+## A. Phylum 
+
+Taxonomic analysis often begins at broader levels (*e.g.,* Phylum) to visualize overarching trends before zooming in on finer-scale patterns. This step allows us to identify which microbial groups dominate across samples and which may respond to environmental gradients like salinity.
+
+Now, let's calculate the relative abundance of the phyla across all the samples. **NOTE:** To do this, it is imperative that we have scaled the data to a constant sequencing depth. 
+
+```{r calc-phylum-df}
+# Create a phylum level dataframe
+phylum_df <- 
+  scaled_physeq %>%
+  # Agglomerate all ASV counts within a phylum
+  tax_glom(taxrank = "Phylum") %>%
+  # Calculate the relative abundance! 
+  transform_sample_counts(function(x) {x/sum(x)}) %>%
+  # Create a dataframe from phyloseq object
+  psmelt() %>%
+  # Filter out Phyla < 1 % 
+  dplyr::filter(Abundance > 0.01) %>%
+  mutate(soil_type = fct_relevel(soil_type, c("Sand", "Florence", "Pendelton", "Lansing")))
+  
+## What are the phylum abundances? 
+phylum_df %>%
+  group_by(Phylum) %>%
+  summarize(mean_PercAbund = round(mean(Abundance), digits = 4)) %>%
+  arrange(-mean_PercAbund) %>%
+  datatable()
+
+# Make a list of phyla the top phyla 
+top10_phyla <- 
+  phylum_df %>%
+  group_by(Phylum) %>%
+  summarize(mean_PercAbund = mean(Abundance)) %>%
+  arrange(-mean_PercAbund) %>%
+  head(n = 10) %>%
+  pull(Phylum)
+```
+
+<span style="color: red;">INTERPRETATION #2: Pseudomonadota was by far the most abundant phyla, followed by Bacillota, Myxoccocota, Acidobacteria, Actinomycetota, Bacteroidota, Chloroflexota, Fibrobacteria, Planctomycetota, and Thermoproteota.  :)</span>
+
+## Stacked Bar plots 
+
+Visualization helps detect patterns in composition and abundance that statistical models may later test. Stacked bar plots are often used but can obscure individual sample variation and visualize too much data all at once. 
+
+Therefore, we will also explore faceted and jittered boxplots below the bar plots to see sample-level trends more clearly.
+
+```{r phylum-stacked-bar, fig.width=9, fig.height=3.5}
+# Stacked Bar Plot With All phyla 
+# Plot Phylum Abundances - make sure to load phylum_colors 
+phylum_df %>%
+  dplyr::filter(Phylum %in% top10_phyla) %>%
+  # Warning: It's important to have one sample per x value, 
+  # otherwise, it will take the sum between multiple samples
+  ggplot(aes(x = soil_type, y = Abundance, fill = Phylum)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  labs(title = "Top 10 Phyla: Surface Samples") + 
+  scale_fill_manual(values = phylum_colors) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+```
+
+
+## Faceted Bar plot 
+
+To help compare the phylum abundance between sample types, we can facet by phylum to better see how the changes occur across the stations, which is masked in the stacked bar plot. It's a little better than the stacked bar plot, however, we can do even better! 
+
+```{r phylum-facet-bar, fig.width=5, fig.height=12}
+phylum_df %>%
+  dplyr::filter(Phylum %in% top10_phyla) %>%
+  # Individual sample comparison of surface waters, whole fraction 
+  # This will allow us to look at individual samples! 
+  # Note that whenever plotting stacked bar plots, you should always look at Individual samples! 
+  ggplot(aes(x = soil_type, y = Abundance, fill = Phylum)) + 
+  facet_grid(~Phylum, scale = "free") + 
+  # add the stacked bar 
+  geom_bar(stat = "identity", color = "black") + 
+  # change the colors to be our selected colors 
+  scale_fill_manual(values = phylum_colors) + 
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+```
+
+
+
+```{r plot-phylum-station, fig.width=12, fig.height=6}
+### Or combined together:
+phylum_df %>%
+  dplyr::filter(Phylum %in% top10_phyla) %>%
+  ggplot(aes(x = soil_type, y = Abundance, fill = Phylum, color = Phylum)) + 
+  facet_grid(~Phylum, scale = "free") + 
+  # add the stacked bar 
+  geom_jitter() +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) + 
+  # change the colors to be our selected colors 
+  scale_fill_manual(values = phylum_colors) + 
+  scale_color_manual(values = phylum_colors) + 
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+```
+
+
+Microbial community composition varied markedly across the soil types! Specifically, several phyla display clear spatial structuring, which is exciting. Of particular interest are myxococcota, pseudomonadota, thermoproteota, and actinomycetota.
+
+Some specific results: 
+
+- **Acidobacteria** hovered around the same value for all ERH soils, while sand (not innoculated with ERH) had lower counts (although this may be due to small sample size)
+- **Pseudomonadota** (formerly Proteobacteria, especially Gammaproteobacteria) had high abundance across all soil types, but increased as soil carbon decreased, so it is possibly outcompeted by organisms that thrive in more nutrient rich environments. **Bacteroidota** also reflected this inverse relationship, but to a lesser extent since it is not as prevalent.
+- **Bacillota** and **Planctomycetota** remain relatively constant across all soil types. They are well adapted to all conditions.
+- **Actinomycetota**, **Myxococcota**, and **Thermoproteota** displayed a direct relationship between soil carbon and relative abundance. Since myxococcota characteristically is predatory, as more resources are available for its prey, it also thrives.
+- **Chloroflexota** and **Fibrobacteria** have an interesting arch where Pendelton soils with intermediate levels of carbon are most beneficiial for this genera.
+
+After initial exploration, we focus on specific phyla that appear to vary across soil_types. These targeted plots help develop hypotheses about ecological drivers.
+
+- Myxococcota
+- Thermoproteota
+- Actinomycetota
+- Pseudomonadota
+
+### A1. Myxococcota
+
+```{r phylum-myxo, fig.width=7, fig.height=3.5}
+# Narrow in on a specific group
+# Myxo - y: abundance, x: station, dot plot + boxplot
+myxo_phylum_soil <- 
+  phylum_df %>%
+  dplyr::filter(Phylum == "Myxococcota") %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Myxococcota Phylum") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+          legend.position = "right")
+# Statistically: Kruskall-Wallis followed by a Tukey's Posthoc test
+# These are non-parametric (non-normal) stat tests 
+
+
+
+# Collect both of the plots together into one 
+myxo_phylum_soil + 
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+```
+
+### A2. Thermoproteota
+
+```{r phylum-thermo, fig.width=7, fig.height=3.5}
+# Narrow in on a specific group
+# Cyanobacteriota - y: abundance, x: station, dot plot + boxplot
+thermo_phylum_soil <- 
+  phylum_df %>%
+  dplyr::filter(Phylum == "Thermoproteota") %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Thermoproteota Phylum") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+          legend.position = "right")
+# Statistically: Kruskall-Wallis followed by a Tukey's Posthoc test
+# These are non-parametric (non-normal) stat tests 
+
+
+
+# Collect both of the plots together into one 
+thermo_phylum_soil + 
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+```
+
+### A3. Actinomycetota
+
+```{r phylum-actino, fig.width=7, fig.height=3.5}
+actino_phylum_soil <- 
+  phylum_df %>%
+  dplyr::filter(Phylum == "Actinomycetota") %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Actinomycetota Phylum") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+          legend.position = "right")
+# Statistically: Kruskall-Wallis followed by a Tukey's Posthoc test
+# These are non-parametric (non-normal) stat tests 
+
+
+
+# Collect both of the plots together into one 
+actino_phylum_soil + 
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+
+```
+### A4. Pseudomondota
+
+```{r phylum-pseudo, fig.width=7, fig.height=3.5}
+pseudo_phylum_soil <- 
+  phylum_df %>%
+  dplyr::filter(Phylum == "Pseudomonadota") %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Pseudomonadota Phylum") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+          legend.position = "right")
+# Statistically: Kruskall-Wallis followed by a Tukey's Posthoc test
+# These are non-parametric (non-normal) stat tests 
+
+
+
+# Collect both of the plots together into one 
+pseudo_phylum_soil + 
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+```
+
+<span style="color: red;">INTERPRETATION #4: Thermoproteota and Myxococcota both show positive relationships between nutrient level and abundance. Pseudomonadota has a stark decline as nutrient levels increase, but this may be a result as it is outcompeted by other phyla. It's characteristically an allelopathic organism, so at low nutrient levels, it may be able to suppress the growth of surrounding phyla. </span>
+
+## B. Genus
+
+Let's first calculate the genus data frame. 
+
+```{r genus-thermo-plots, fig.width=12, fig.height=4}
+# Calculate the Family relative abundance 
+# Note: The read depth MUST be normalized in some way: scale_reads
+genus_df <- 
+  scaled_physeq %>%
+  # agglomerate at the phylum level 
+  tax_glom(taxrank = "Genus") %>% 
+  # Transform counts to relative abundance 
+  transform_sample_counts(function (x) {x/sum(x)}) %>%
+  # Melt to a long format 
+  psmelt() %>%
+  # Fix the order of date
+  mutate(
+         soil_type = fct_relevel(soil_type, c("Sand", "Florence", "Pendelton", "Lansing")))
+```
+
+
+### B1. Thermoproteota Genera 
+
+```{r thermo-genus, fig.width=6, fig.height=6}
+# Plot genus 
+thermo_genus_soil <- 
+  genus_df %>%
+  dplyr::filter(Phylum == "Thermoproteota") %>%
+  # At first, plot all of the genera and then subset the ones that have intersting trends
+  # dplyr::filter(Genus %in% c("hgcI clade", "CL500-29 marine group")) %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  facet_wrap(.~Genus, scales = "free_y", nrow = 1) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Thermoproteota Genera") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+        legend.position = "none")
+
+thermo_genus_soil +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+```
+
+### B2. Myxo Genera 
+
+```{r pseudo-genus, fig.width=6, fig.height=6}
+myxo_genus_soil <- 
+  genus_df %>%
+  dplyr::filter(Phylum == "Myxococcota") %>%
+  # At first, plot all of the genera and then subset the ones that have intersting trends
+  dplyr::filter(Genus %in% c("Sandaracinus", "Sorangium", "Kofleria")) %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  facet_wrap(.~Genus, scales = "free_y", nrow = 1) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Myxococcota Genera") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+        legend.position = "none")
+myxo_genus <- genus_df %>% dplyr::filter(Phylum == "Myxococcota")
+myxo_genus_soil
+```
+<span style="color: red;">INTERPRETATION #5: There is a huge variability across genera. Even with Thermoproteota, which seemed to have a strong correlation between nutrient level and abundance, individual genera tell a different story. </span>
+
+## C. ASV level
+
+
+```{r ASV-plots, fig.width=12, fig.height=4}
+# Calculate the Family relative abundance 
+# Note: The read depth MUST be normalized in some way: scale_reads
+ASV_df <- 
+  scaled_physeq %>%
+  # Prune out ASVs that have fewer than 100 counts! 
+  ## LOOK AT HOW MANY ARE REMOVED! We scaled to 9539 reads! 
+  prune_taxa(taxa_sums(.) >= 954, .) %>%
+  # agglomerate at the phylum level 
+  tax_glom(taxrank = "ASV") %>% 
+  # Transform counts to relative abundance 
+  transform_sample_counts(function (x) {x/sum(x)}) %>%
+  # Melt to a long format 
+  psmelt() %>%
+  # fix the order of date
+mutate(
+         soil_type = fct_relevel(soil_type, c("Sand", "Florence", "Pendelton", "Lansing")))
+```
+
+### C1. Myxo ASVs 
+
+```{r myxo-asvs, fig.width=6, fig.height=8}
+top_myxo_ASVs <- 
+  ASV_df %>%
+  dplyr::filter(Phylum == "Myxococcota") %>%
+  group_by(ASV) %>%
+  summarize(mean_Abundance = mean(Abundance)) %>%
+  dplyr::filter(mean_Abundance > 0.005) %>%
+  pull(ASV)
+
+myxo_asv_soil <- 
+  ASV_df %>%
+  dplyr::filter(ASV %in% top_myxo_ASVs) %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  facet_wrap(Genus~ASV, scales = "free_y", nrow = 2) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Myxococcota ASVs") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+        legend.position = "none")
+
+myxo_asv_soil + 
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+```
+
+```{r thermo-asvs, fig.width=6, fig.height=8}
+top_thermo_ASVs <- 
+  ASV_df %>%
+  dplyr::filter(Phylum == "Thermoproteota") %>%
+  group_by(ASV) %>%
+  summarize(mean_Abundance = mean(Abundance)) %>%
+  dplyr::filter(mean_Abundance > 0.005) %>%
+  pull(ASV)
+
+thermo_asv_soil <- 
+  ASV_df %>%
+  dplyr::filter(ASV %in% top_thermo_ASVs) %>%
+  # build the plot 
+  ggplot(aes(x = soil_type, y = Abundance, 
+             fill = soil_type, color = soil_type)) + 
+  facet_wrap(Genus~ASV, scales = "free_y", nrow = 2) + 
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) + # outliers not plotted here in boxplot 
+  geom_jitter() + 
+  theme_bw() + 
+  labs(title = "Thermoproteota ASVs") + 
+  scale_color_manual(values = soil_colors) + 
+  scale_fill_manual(values = soil_colors) + 
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+        legend.position = "none")
+
+thermo_asv_soil + 
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+```
+
+<span style="color: red;">INTERPRETATION #6: ASV_0010, ASV_0022, ASV_0028, and ASV_0069 for myxococcota. For Thermoproteota, Candidatus Nitrosocoscmicus (ASV_0045) and ASV_0046 were the most abundant.</span>
+
+<span style="color: red;">INTERPRETATION #7: The ASVs mostly had niche specific trends. While ASV_0045, ASV_0022, and ASV_0069 all had generally positive relationships between nutrient levels and abundance, this was not as strong as on the phylum level. Most ASVs displayed a general increased abundnace as nutrient increases. A notable exception is ASV_0028 which had high relative abundance in Sand, but not in other soils.</span>
+
+<span style="color: red;">INTERPRETATION #8: The ASVs for Myxo are NA, while in Thermoproteota, one of the ASVs of interest is Candidatus Nitrosocoscmicus. This is interesting since it's a ammonia oxidizing bacteria, which plays a role in the nitrogen cyclign of an environment.</span>
+
+
+# Session Information 
+For reproducibility 
+```{r session_info}
+devtools::session_info()
+```
